@@ -3,3 +3,5 @@ torchvision
 transformers==4.55.4
 sentencepiece
 Pillow
+opencv-python
+numpy
