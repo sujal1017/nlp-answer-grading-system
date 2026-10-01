@@ -1,0 +1,5 @@
+torch
+torchvision
+transformers==4.55.4
+sentencepiece
+Pillow
