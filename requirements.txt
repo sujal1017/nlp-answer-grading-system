@@ -1,0 +1,9 @@
+# Multimodal & Vision-Language Processing
+transformers
+accelerate
+qwen-vl-utils
+torchvision
+
+# Note: PyTorch is required but should be installed manually 
+# using the specific CUDA wheel for your hardware, e.g.:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
