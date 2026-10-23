@@ -1,9 +1,31 @@
-# Multimodal & Vision-Language Processing
+
+# ==========================================
+# AI Grader - Project Dependencies
+# ==========================================
+
+# Web application interface
+streamlit
+
+# Hugging Face model loading and inference
 transformers
 accelerate
-qwen-vl-utils
-torchvision
+huggingface-hub
+safetensors
+tokenizers
 
-# Note: PyTorch is required but should be installed manually 
-# using the specific CUDA wheel for your hardware, e.g.:
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+# Qwen vision-language model utilities
+qwen-vl-utils
+Pillow
+
+# Image and computer vision processing
+torchvision
+numpy
+
+# Data processing and storage utilities
+pandas
+
+# ==========================================
+# IMPORTANT:
+# Install CUDA-enabled PyTorch separately.
+# See the README for installation instructions.
+# ==========================================
