@@ -14,7 +14,7 @@ class LocalGradingEngine:
         self.processor = None
 
     def load_model(self):
-        """Loads Qwen2-VL-2B into GPU VRAM in bfloat16 only if not already loaded."""
+        """Loads Qwen2-VL-2B into RTX 4050 VRAM with balanced pixel limits."""
         if self.model is None:
             print("[*] Loading Qwen2-VL-2B-Instruct into RTX 4050 VRAM...")
             self.model = Qwen2VLForConditionalGeneration.from_pretrained(
@@ -22,10 +22,14 @@ class LocalGradingEngine:
                 torch_dtype=torch.bfloat16,
                 device_map="auto"
             )
-            self.processor = AutoProcessor.from_pretrained(MODEL_ID)
+            # Limit max_pixels so high-res PDF pages don't exhaust 6GB VRAM or trigger box tokens
+            self.processor = AutoProcessor.from_pretrained(
+                MODEL_ID,
+                min_pixels=256 * 28 * 28,
+                max_pixels=1024 * 28 * 28
+            )
 
     def unload_model(self):
-        """Frees GPU VRAM after batch processing."""
         if self.model is not None:
             print("[*] Releasing GPU VRAM...")
             del self.model
@@ -34,8 +38,14 @@ class LocalGradingEngine:
             self.processor = None
             torch.cuda.empty_cache()
 
-    def _generate_text(self, messages: List[Dict], max_tokens: int = 512, temperature: float = 0.1) -> str:
-        """Internal helper to run multimodal or text-only inference."""
+    def _generate_text(
+        self,
+        messages: List[Dict],
+        max_tokens: int = 768,
+        temperature: float = 0.0,
+        repetition_penalty: float = 1.15
+    ) -> str:
+        """Runs inference with repetition_penalty to prevent infinite table loops."""
         self.load_model()
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs, video_inputs = process_vision_info(messages)
@@ -48,7 +58,10 @@ class LocalGradingEngine:
             return_tensors="pt"
         ).to(self.model.device)
 
-        gen_kwargs = {"max_new_tokens": max_tokens}
+        gen_kwargs = {
+            "max_new_tokens": max_tokens,
+            "repetition_penalty": repetition_penalty
+        }
         if temperature > 0.0:
             gen_kwargs["temperature"] = temperature
             gen_kwargs["do_sample"] = True
@@ -67,19 +80,25 @@ class LocalGradingEngine:
         return output.strip()
 
     def transcribe_images(self, image_paths: List[str], is_question_paper: bool = False) -> str:
-        """Runs OCR across one or more images (Question Paper or Student Booklet)."""
+        """Runs OCR across Question Paper or Student Booklet pages without bounding boxes or tables."""
         pages_md = []
-        prompt_text = (
-            "Transcribe this university question paper verbatim into plain text. "
-            "Keep question numbers like 'Q. No. 1', sub-questions 'a)', 'b)', and mark tags like '[5M, CO:1]' intact."
-            if is_question_paper else
-            "Transcribe all handwritten student answers in this image verbatim into clean Markdown. "
-            "Preserve question numbers (e.g., Q1a, 1b, Ans 1), headers, and bullet points accurately."
-        )
+        if is_question_paper:
+            prompt_text = (
+                "Read this exam question paper image and transcribe every question verbatim as plain text. "
+                "Format each question on a new line starting with its number, such as:\n"
+                "Q1 (a) <question text> 5 Marks CO-1\n"
+                "Q1 (b) <question text> 5 Marks CO-2\n"
+                "Do NOT output coordinates, bounding boxes, or Markdown tables."
+            )
+        else:
+            prompt_text = (
+                "Read this handwritten student answer page and transcribe the handwritten text accurately into plain paragraphs and bullet points. "
+                "Preserve question numbers written in the margin such as 'a)', '2] (b)', '3] a', '3b)'. "
+                "Do NOT use Markdown tables (`| --- |`) and do NOT repeat phrases."
+            )
 
         for idx, img_path in enumerate(image_paths):
             if not os.path.exists(img_path):
-                print(f"[-] Warning: File not found -> {img_path}")
                 continue
             print(f"[*] OCR Processing Page {idx + 1}/{len(image_paths)}: {img_path}")
             messages = [
@@ -91,27 +110,24 @@ class LocalGradingEngine:
                     ]
                 }
             ]
-            page_text = self._generate_text(messages, max_tokens=1024, temperature=0.0)
+            page_text = self._generate_text(messages, max_tokens=768, temperature=0.0, repetition_penalty=1.18)
             pages_md.append(f"### Page {idx + 1}\n{page_text}")
 
         return "\n\n---\n\n".join(pages_md)
 
     def generate_rubric_points(self, question_text: str, max_marks: int, num_points: int = 4) -> List[Dict]:
-        """
-        Auto-generates weighted evaluation criteria from an extracted Question Paper prompt.
-        Each point receives an initial weight = max_marks / num_points.
-        """
+        """Generates 4 weighted rubric criteria for an extracted question."""
         print(f"[*] Generating initial rubric key points for: {question_text[:50]}...")
-        prompt = f"""You are an engineering professor creating an evaluation scheme for an exam question.
+        prompt = f"""You are a university professor creating an evaluation scheme for "Research Methodology & IPR".
 Question: "{question_text}"
 Maximum Marks: {max_marks}
 
-Break the ideal answer down into exactly {num_points} distinct, atomic key points that a student must write to get full marks.
-Respond ONLY with a valid JSON array of strings, like this:
-["Point 1 description", "Point 2 description", "Point 3 description", "Point 4 description"]"""
+List exactly {num_points} core concepts or points a student should cover to earn full marks.
+Respond ONLY with a valid JSON array of {num_points} strings:
+["Concept 1", "Concept 2", "Concept 3", "Concept 4"]"""
 
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-        raw_output = self._generate_text(messages, max_tokens=256, temperature=0.1)
+        raw_output = self._generate_text(messages, max_tokens=256, temperature=0.0, repetition_penalty=1.05)
 
         points_list = []
         match = re.search(r'\[.*\]', raw_output, re.DOTALL)
@@ -119,17 +135,16 @@ Respond ONLY with a valid JSON array of strings, like this:
             try:
                 parsed = json.loads(match.group(0))
                 if isinstance(parsed, list):
-                    points_list = [str(p).strip() for p in parsed if str(p).strip()]
+                    points_list = [str(p).strip() for p in parsed if str(p).strip()][:num_points]
             except json.JSONDecodeError:
                 pass
 
-        # Fallback if JSON parsing fails
         if not points_list:
             points_list = [
-                f"Core definition and concept explanation for: {question_text[:40]}",
-                "Detailed technical working, architecture, or classification",
-                "Relevant diagram, illustration, or practical example",
-                "Accurate conclusion or key properties"
+                f"Clear definition and core meaning of {question_text[:35]}",
+                "Major classifications, steps, or essential features explained",
+                "Explanation of sub-types or key variables with examples",
+                "Logical structure and coverage of required concepts"
             ]
 
         default_weight = round(float(max_marks) / len(points_list), 2)
@@ -144,11 +159,8 @@ Respond ONLY with a valid JSON array of strings, like this:
         verified_examples: List[Dict] = None
     ) -> Dict:
         """
-        Evaluates a student's chunked answer using:
-        1. Atomic rubric matching + live teacher-calibrated weights.
-        2. Few-shot calibration from previous teacher-verified answers.
+        Grades a student's answer chunk fairly (ignoring minor OCR spelling artifacts in handwritten scripts).
         """
-        # Normalize key_points into weighted dicts
         norm_points = []
         default_w = round(float(max_marks) / max(len(key_points), 1), 2)
         for item in key_points:
@@ -161,7 +173,6 @@ Respond ONLY with a valid JSON array of strings, like this:
             [f"{i+1}. {p['point']} (Weight: {p['weight']} marks)" for i, p in enumerate(norm_points)]
         )
 
-        # Build Few-Shot Calibration block from past teacher approvals
         few_shot_block = ""
         if verified_examples:
             examples_str = []
@@ -171,47 +182,46 @@ Respond ONLY with a valid JSON array of strings, like this:
                     f"  Teacher Approved Score: {ex['teacher_score']} / {max_marks}\n"
                     f"  Teacher Feedback: {ex['ai_feedback']}"
                 )
-            few_shot_block = (
-                "\nReference Past Teacher Grading for Calibration:\n"
-                + "\n".join(examples_str) + "\n"
-            )
+            few_shot_block = "\nPast Teacher Grading Reference:\n" + "\n".join(examples_str) + "\n"
 
-        prompt = f"""You are a strict university examiner grading a student answer booklet.
+        prompt = f"""You are a supportive university professor grading a handwritten Internal Assessment answer sheet.
+Ignore minor spelling or OCR transcription errors if the student's conceptual understanding is clear.
 
 Question: {question_text}
 Maximum Marks: {max_marks}
 
-Rubric Checklist (with calibrated weights):
+Rubric Key Points:
 {rubric_numbered}
 {few_shot_block}
-Student's Answer:
+Student's Handwritten Answer (OCR Transcribed):
 \"\"\"{student_answer}\"\"\"
 
-Task:
-Check which numbered rubric points (1 to {len(norm_points)}) are clearly answered by the student.
+Instructions:
+1. Identify which rubric points (1 to {len(norm_points)}) the student has addressed (even if phrased in their own words).
+2. Award full or near-full marks if the student has written a detailed, structured answer covering multiple sub-points.
 Respond ONLY with a valid JSON object in this exact format:
 {{
-  "matched_indices": [1, 2],
-  "llm_suggested_score": 2.5,
-  "feedback": "Concise 2-sentence explanation of what the student covered and what was missed."
+  "matched_indices": [1, 2, 3, 4],
+  "llm_suggested_score": 4.5,
+  "feedback": "Concise 2-sentence summary of strengths and any minor omissions."
 }}"""
 
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-        raw_output = self._generate_text(messages, max_tokens=300, temperature=0.0)
+        raw_output = self._generate_text(messages, max_tokens=300, temperature=0.0, repetition_penalty=1.05)
 
         matched_indices = []
         llm_score = 0.0
-        feedback = "Evaluated against rubric checklist."
+        feedback = "Evaluated against question rubric."
 
         match = re.search(r'\{.*\}', raw_output, re.DOTALL)
         if match:
             try:
                 data = json.loads(match.group(0))
-                matched_indices = data.get("matched_indices", [])
+                matched_indices = [int(i) for i in data.get("matched_indices", []) if str(i).isdigit()]
                 llm_score = float(data.get("llm_suggested_score", 0.0))
                 feedback = str(data.get("feedback", feedback))
             except Exception:
-                feedback = f"Partial parse. Model output: {raw_output[:150]}"
+                feedback = f"Evaluated answer. Raw notes: {raw_output[:150]}"
 
         matched_points = []
         missing_points = []
@@ -225,10 +235,9 @@ Respond ONLY with a valid JSON object in this exact format:
             else:
                 missing_points.append(item["point"])
 
-        # Combine calibrated rubric weight sum with LLM score if indices were matched
-        final_score = weighted_score_sum if matched_indices else llm_score
-        # Clamp strictly between 0 and max_marks (rounded to nearest 0.5 or 0.25)
-        final_score = round(min(max(final_score, 0.0), float(max_marks)) * 4) / 4
+        # Take the higher of the calibrated rubric sum or LLM holistic score if the student wrote a lengthy answer
+        final_score = max(weighted_score_sum, llm_score) if matched_indices else llm_score
+        final_score = round(min(max(final_score, 0.0), float(max_marks)) * 2) / 2  # Round to nearest 0.5
 
         return {
             "matched_points": matched_points,
@@ -236,8 +245,3 @@ Respond ONLY with a valid JSON object in this exact format:
             "ai_score": final_score,
             "ai_feedback": feedback
         }
-
-if __name__ == "__main__":
-    # Quick sanity test without loading the 4.5GB model until needed
-    engine = LocalGradingEngine()
-    print("[+] LocalGradingEngine initialized and ready.")

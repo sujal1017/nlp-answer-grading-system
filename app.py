@@ -17,11 +17,11 @@ from database import (
 from chunker import (
     parse_sdmcet_question_paper,
     chunk_student_booklet,
-    calculate_ia_total
+    calculate_ia_total,
+    convert_pdf_to_images
 )
 from engine import LocalGradingEngine
 
-# Initialize DB
 init_db()
 
 st.set_page_config(
@@ -31,19 +31,14 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ==============================================================================
-# CUSTOM MODERN UI CSS (HIDES DEFAULT STREAMLIT CHROME)
-# ==============================================================================
 st.markdown("""
 <style>
-    /* Import Google Font 'Inter' */
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
     html, body, [class*="css"] {
         font-family: 'Inter', sans-serif;
     }
 
-    /* Hide Default Streamlit Header, Footer, Hamburger Menu & Deploy Button */
     #MainMenu {visibility: hidden !important;}
     header {visibility: hidden !important; height: 0px !important;}
     footer {visibility: hidden !important;}
@@ -52,14 +47,12 @@ st.markdown("""
     [data-testid="stDecoration"] {display: none !important;}
     [data-testid="stStatusWidget"] {visibility: hidden !important;}
 
-    /* Reduce top padding left behind by hidden header */
     .block-container {
         padding-top: 1.5rem !important;
         padding-bottom: 2rem !important;
         max-width: 96% !important;
     }
 
-    /* Sidebar Styling */
     [data-testid="stSidebar"] {
         background-color: #0F172A !important;
         border-right: 1px solid #1E293B;
@@ -73,7 +66,6 @@ st.markdown("""
         color: #FFFFFF !important;
     }
 
-    /* Custom Top App Banner */
     .top-nav {
         background: linear-gradient(135deg, #0F172A 0%, #1E293B 100%);
         padding: 1.25rem 1.75rem;
@@ -108,7 +100,6 @@ st.markdown("""
         font-weight: 600;
     }
 
-    /* Metric KPI Cards */
     .kpi-card {
         background: #FFFFFF;
         border-radius: 12px;
@@ -131,7 +122,6 @@ st.markdown("""
         margin-top: 0.2rem;
     }
 
-    /* Modern Section Cards */
     .surface-card {
         background: #FFFFFF;
         border: 1px solid #E2E8F0;
@@ -141,7 +131,6 @@ st.markdown("""
         box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
     }
 
-    /* Status Pills */
     .pill-verified {
         background-color: #DCFCE7;
         color: #166534;
@@ -167,7 +156,6 @@ st.markdown("""
         font-weight: 600;
     }
 
-    /* Modern Tabs Styling */
     .stTabs [data-baseweb="tab-list"] {
         gap: 10px;
         background-color: #F1F5F9;
@@ -190,7 +178,6 @@ st.markdown("""
         box-shadow: 0 2px 6px rgba(15, 23, 42, 0.08);
     }
 
-    /* Primary Buttons */
     .stButton > button {
         background: linear-gradient(135deg, #4F46E5 0%, #4338CA 100%);
         color: white !important;
@@ -253,7 +240,6 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# Fetch live stats for KPI bar
 active_rubrics = get_exam_rubrics(selected_exam) if selected_exam != "No Exams Created" else []
 active_subs = get_exam_submissions(selected_exam) if selected_exam != "No Exams Created" else []
 unique_students = len({s["student_id"] for s in active_subs})
@@ -307,20 +293,20 @@ with tab1:
     with col_setup:
         st.markdown('<div class="surface-card">', unsafe_allow_html=True)
         st.markdown("#### 📄 Initialize New Exam Workspace")
-        st.caption("Upload a scanned Question Paper or paste the text to generate weighted rubrics.")
+        st.caption("Upload a Question Paper (Image or PDF) or paste text directly.")
 
-        new_exam_id = st.text_input("Exam Identifier", value="IA1_2026").strip().upper()
-        new_exam_title = st.text_input("Subject / Course Title", value="Research Methodology & IPR")
+        new_exam_id = st.text_input("Exam Identifier", value="IA1_RM_2026").strip().upper()
+        new_exam_title = st.text_input("Subject / Course Title", value="22URMK506 – Research Methodology & IPR")
 
         qp_files = st.file_uploader(
-            "Question Paper Scan (PNG/JPG)",
-            type=["png", "jpg", "jpeg"],
+            "Question Paper Scan (PNG, JPG, or PDF)",
+            type=["png", "jpg", "jpeg", "pdf"],
             accept_multiple_files=True
         )
         manual_qp_text = st.text_area(
             "Or Paste Question Paper Text Directly:",
             height=130,
-            placeholder="Q. No. 1\na) Define a research problem... [5M, CO:1]\nb) Explain literature review... [5M, CO:1]"
+            placeholder="Q1 (a) Define research and explain its major objectives. 5 Marks CO-1\nQ1 (b) Describe the systematic procedure involved in reviewing the literature. 5 Marks CO-2"
         )
 
         if st.button("✨ Extract Questions & Build Rubrics", use_container_width=True):
@@ -334,21 +320,26 @@ with tab1:
                     qp_dir = os.path.join("data", "exams", new_exam_id)
                     os.makedirs(qp_dir, exist_ok=True)
                     for f in qp_files:
-                        p = os.path.join(qp_dir, f.name)
-                        with open(p, "wb") as out:
-                            out.write(f.getbuffer())
-                        qp_paths.append(p)
+                        if f.name.lower().endswith(".pdf"):
+                            pdf_imgs = convert_pdf_to_images(f.read(), qp_dir)
+                            qp_paths.extend(pdf_imgs)
+                        else:
+                            p = os.path.join(qp_dir, f.name)
+                            with open(p, "wb") as out:
+                                out.write(f.getbuffer())
+                            qp_paths.append(p)
 
                     with st.spinner("Running Qwen2-VL OCR on Question Paper..."):
                         raw_qp_md = engine.transcribe_images(qp_paths, is_question_paper=True)
 
                 if not raw_qp_md:
-                    st.error("Upload an image or paste the question paper text first.")
+                    st.error("Upload an image/PDF or paste the question paper text first.")
                 else:
                     create_exam(new_exam_id, new_exam_title, qp_paths, raw_qp_md)
                     parsed_questions = parse_sdmcet_question_paper(raw_qp_md)
 
                     if not parsed_questions:
+                        st.warning("Could not auto-detect Q1a/Q1b format; saving as Q1A. Check OCR output.")
                         parsed_questions = [{"question_id": "Q1A", "question_text": raw_qp_md, "max_marks": 5}]
 
                     with st.spinner(f"Synthesizing atomic rubrics for {len(parsed_questions)} questions..."):
@@ -362,7 +353,7 @@ with tab1:
                                 weighted_pts
                             )
                     engine.unload_model()
-                    st.toast(f"Workspace {new_exam_id} initialized!", icon="🎉")
+                    st.toast(f"Workspace {new_exam_id} initialized with {len(parsed_questions)} questions!", icon="🎉")
                     st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -406,7 +397,7 @@ with tab1:
 with tab2:
     st.markdown('<div class="surface-card">', unsafe_allow_html=True)
     st.markdown(f"#### 📝 Batch Booklet Digitization — Workspace: `{selected_exam}`")
-    st.caption("Upload multi-page handwritten booklets in sequential order. Cross-page answers are merged automatically.")
+    st.caption("Upload a student booklet PDF (like test.pdf) or sequential page images.")
 
     if selected_exam == "No Exams Created":
         st.warning("Create or select an exam workspace in Tab 01 first.")
@@ -415,34 +406,38 @@ with tab2:
         with u_col1:
             student_usn = st.text_input("Student USN / Roll ID", value="2SD23CS082").strip().upper()
         with u_col2:
-            booklet_pages = st.file_uploader(
-                "Upload Handwritten Pages (page_1, page_2...)",
-                type=["png", "jpg", "jpeg"],
+            booklet_files = st.file_uploader(
+                "Upload Handwritten Booklet (PDF or PNG/JPG Images)",
+                type=["pdf", "png", "jpg", "jpeg"],
                 accept_multiple_files=True
             )
 
         if st.button("🚀 Run Multi-Page OCR & Automated Grading", use_container_width=True):
-            if not student_usn or not booklet_pages:
-                st.error("Provide a valid Student USN and upload at least one page.")
+            if not student_usn or not booklet_files:
+                st.error("Provide a valid Student USN and upload at least one PDF or image file.")
             else:
                 student_dir = os.path.join("data", "booklets", selected_exam, student_usn)
                 os.makedirs(student_dir, exist_ok=True)
                 saved_page_paths = []
-                for idx, page_file in enumerate(booklet_pages):
-                    ext = os.path.splitext(page_file.name)[1]
-                    page_path = os.path.join(student_dir, f"page_{idx+1}{ext}")
-                    with open(page_path, "wb") as out:
-                        out.write(page_file.getbuffer())
-                    saved_page_paths.append(page_path)
 
-                with st.spinner("1/3 • Extracting handwritten text with Qwen2-VL..."):
+                for idx, page_file in enumerate(booklet_files):
+                    if page_file.name.lower().endswith(".pdf"):
+                        pdf_imgs = convert_pdf_to_images(page_file.read(), student_dir)
+                        saved_page_paths.extend(pdf_imgs)
+                    else:
+                        ext = os.path.splitext(page_file.name)[1]
+                        page_path = os.path.join(student_dir, f"page_{idx+1}{ext}")
+                        with open(page_path, "wb") as out:
+                            out.write(page_file.getbuffer())
+                        saved_page_paths.append(page_path)
+
+                with st.spinner(f"1/3 • Extracting handwritten text across {len(saved_page_paths)} pages with Qwen2-VL..."):
                     full_booklet_md = engine.transcribe_images(saved_page_paths, is_question_paper=False)
 
                 rubric_map = {r["question_id"].upper(): r for r in active_rubrics}
-                expected_qids = list(rubric_map.keys())
 
-                with st.spinner("2/3 • Segmenting booklet by question boundaries..."):
-                    chunks = chunk_student_booklet(full_booklet_md, expected_q_ids=expected_qids)
+                with st.spinner("2/3 • Segmenting booklet by question boundaries & matching orphan headers..."):
+                    chunks = chunk_student_booklet(full_booklet_md, rubrics=active_rubrics)
 
                 with st.spinner("3/3 • Grading chunks against calibrated rubric weights..."):
                     for q_id, ans_text in chunks.items():
@@ -467,7 +462,7 @@ with tab2:
                                 ai_feedback=eval_res["ai_feedback"]
                             )
                 engine.unload_model()
-                st.toast(f"Evaluated {len(chunks)} answers for {student_usn}!", icon="✅")
+                st.toast(f"Evaluated {len(chunks)} answers ({list(chunks.keys())}) for {student_usn}!", icon="✅")
                 st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -493,7 +488,7 @@ with tab3:
             <div class="surface-card" style="display:flex; justify-content:space-between; align-items:center; padding: 0.9rem 1.4rem;">
                 <div>
                     <span style="font-size:0.8rem; color:#64748B; font-weight:600;">SDMCET IA CHOICE RULE TOTAL (MAX(Q1, Q2) + Q3)</span><br>
-                    <span style="font-size:0.9rem; color:#0F172A;">Student USN: <b>{selected_student}</b></span>
+                    <span style="font-size:0.9rem; color:#0F172A;">Student USN: <b>{selected_student}</b> • Answered: <b>{', '.join(scores_dict.keys())}</b></span>
                 </div>
                 <div style="font-size:1.6rem; font-weight:700; color:#4F46E5;">
                     {ia_total} / 20 Marks
@@ -525,7 +520,7 @@ with tab3:
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.6rem;">
                         <span style="font-size:1.1rem; font-weight:700; color:#0F172A;">Question {qid}</span>
                         <div>
-                            <span class="pill-marks">AI Score: {sub['ai_score']}</span>
+                            <span class="pill-marks">AI Score: {sub['ai_score']} / 5</span>
                             {badge_html}
                         </div>
                     </div>
