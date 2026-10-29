@@ -1,2 +1,6 @@
 /__pycache__
 grading_system.db
+/data/booklets
+/data/exams
+/test
+training_dataset.jsonl
