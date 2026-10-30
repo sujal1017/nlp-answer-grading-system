@@ -11,7 +11,7 @@ from typing import Optional
 # optional prefix, number, optional separator, optional sub letter, closing punctuation
 MARKER_RE = re.compile(
     r"^\s*(?P<prefix>(?:Q(?:uestion)?\.?\s*(?:No\.?)?|Ans(?:wer)?\.?)\s*)?"
-    r"(?P<num>\d{1,2})\s*[\]\)\.\-:]?\s*\(?(?P<sub>[a-hA-H])?\)?\s*(?P<close>[\]\)\.:\-])?\s*(?P<rest>.*)$",
+    r"(?P<num>\d{1,2})\s*[\]\)\.\-:]?\s*\(?(?:(?P<sub>[a-hA-H])(?=[\]\)\.:]))?\)?\s*(?P<close>[\]\)\.:\-])?\s*(?P<rest>.*)$",
     re.IGNORECASE,
 )
 SUB_ONLY_RE = re.compile(r"^\s*\(?(?P<sub>[a-hA-H])\s*[\)\.\]:]\s*(?P<rest>.*)$")

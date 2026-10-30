@@ -188,11 +188,12 @@ def upload_question_paper(exam_id):
                    page_analysis=[p.to_dict() for p in pages])
     db.session.add(doc)
     db.session.commit()
-    job = create_job("extract_questions", doc.id)
+    doc_id = doc.id  # capture now: the request session is closed by the time a background thread runs
+    job = create_job("extract_questions", doc_id)
     result = {}
 
     def work(progress):
-        result.update(workflow.extract_question_paper(db.session.get(Exam, exam_id), db.session.get(Document, doc.id), progress))
+        result.update(workflow.extract_question_paper(db.session.get(Exam, exam_id), db.session.get(Document, doc_id), progress))
 
     run_job(job, work)
     db.session.refresh(job)
@@ -408,7 +409,8 @@ def upload_answer_sheet(exam_id):
     db.session.add(sub)
     db.session.commit()
     job = create_job("answer_sheet_ocr", sub.id)
-    run_job(job, lambda progress: workflow.run_answer_sheet_ocr(sub.id, progress))
+    sub_id = sub.id  # capture now: the request session is closed by the time the thread runs
+    run_job(job, lambda progress: workflow.run_answer_sheet_ocr(sub_id, progress))
     db.session.refresh(job)
     db.session.refresh(sub)
     return jsonify({"submission": submission_dict(sub, True), "job": job_dict(job)}), 202 if job.status != "done" else 201
@@ -473,7 +475,8 @@ def patch_submission(sid):
 def rerun_ocr(sid):
     s = get_or_404(Submission, sid)
     job = create_job("answer_sheet_ocr", s.id)
-    run_job(job, lambda progress: workflow.run_answer_sheet_ocr(s.id, progress))
+    sub_id = s.id
+    run_job(job, lambda progress: workflow.run_answer_sheet_ocr(sub_id, progress))
     db.session.refresh(job)
     return jsonify({"job": job_dict(job)}), 202
 
@@ -539,7 +542,8 @@ def evaluate(sid):
     s = get_or_404(Submission, sid)
     force = bool(body().get("force"))
     job = create_job("evaluate", s.id)
-    run_job(job, lambda progress: workflow.evaluate_submission(s.id, progress, force))
+    sub_id = s.id
+    run_job(job, lambda progress: workflow.evaluate_submission(sub_id, progress, force))
     db.session.refresh(job)
     return jsonify({"job": job_dict(job)}), 202
 
