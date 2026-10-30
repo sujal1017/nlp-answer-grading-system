@@ -135,3 +135,20 @@ def test_correlation_is_not_agreement():
     ai, human = [1, 2, 3, 4, 5], [6, 7, 8, 9, 10]  # perfectly correlated, never equal
     m = compute_metrics(ai, human)
     assert m["pearson"] == 1.0 and m["exact_agreement"] == 0.0 and m["mae"] == 5.0
+
+
+def test_first_letter_of_answer_word_is_not_a_subquestion():
+    """Regression: 'Q1. An index ...' / 'Q2. A primary key ...' must not parse the A as sub-question 'a'."""
+    from app.services.answer_mapping import map_answers
+    r = map_answers([(1, "Q1. An index speeds up search.\nQ2. A primary key is unique.")], ["Q1", "Q2"])
+    assert r.segments["Q1"].text.startswith("An index")
+    assert r.segments["Q2"].text.startswith("A primary key")
+    assert not r.unmapped_text
+
+
+def test_real_subquestion_markers_still_work():
+    from app.services.answer_mapping import map_answers
+    r = map_answers([(1, "Q1 a) first part\nb) second part")], ["Q1A", "Q1B"])
+    assert r.segments["Q1A"].text == "first part" and r.segments["Q1B"].text == "second part"
+    r = map_answers([(1, "1(a) alpha\n1(b) beta")], ["Q1A", "Q1B"])
+    assert set(r.segments) == {"Q1A", "Q1B"}
