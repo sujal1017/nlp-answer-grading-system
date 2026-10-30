@@ -1,2 +1,14 @@
-/__pycache__
-grading_system.db
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+frontend/dist/
+.env
+*.db
+*.sqlite3
+backend/instance/
+backend/uploads/
+data/
+training_dataset.jsonl
+.pytest_cache/
