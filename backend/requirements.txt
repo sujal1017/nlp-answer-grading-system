@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pymupdf
+pydantic
+transformers
+accelerate
+qwen-vl-utils
+torchvision
+
+# Install CUDA PyTorch separately for the RTX 4050, e.g.:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126

@@ -4,3 +4,12 @@ grading_system.db
 /data/exams
 /test
 training_dataset.jsonl
+backend/__pycache__
+backend/grading_system.db
+backend/data/booklets
+backend/data/exams
+backend/data/training_dataset.jsonl
+frontend/node_modules
+frontend/dist
+.env
+*.pyc
