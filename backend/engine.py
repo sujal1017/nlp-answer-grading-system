@@ -187,18 +187,28 @@ PREFIX_RE = re.compile(
 )
 
 
+def _strip_coordinates_and_noise(text: str) -> str:
+    """Strips bounding box coordinates, grounding tags, and hallucinated quiz blocks."""
+    if not text:
+        return ""
+    # Coordinate pairs: r'\(\s*\d+\s*,\s*\d+\s*\)\s*(?:,\s*\(\s*\d+\s*,\s*\d+\s*\))?'
+    text = re.sub(r"\(\s*\d+\s*,\s*\d+\s*\)\s*(?:,\s*\(\s*\d+\s*,\s*\d+\s*\))?", "", text)
+    text = re.sub(r"\[\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\]", "", text)
+    # Grounding tags: r'<\|.*?\|>'
+    text = re.sub(r"<\|.*?\|>", "", text)
+    text = re.sub(r"<ref>.*?</ref>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<box>.*?</box>", "", text, flags=re.DOTALL)
+    # Hallucinated quiz blocks: r'(?i)(?:^|\n)\s*(?:#+\s*)?Question\s+\d+\s*:\s*What\b.*'
+    text = re.sub(r"(?i)(?:^|\n)\s*(?:#+\s*)?Question\s+\d+\s*:\s*What\b.*", "", text)
+    return text.strip()
+
+
 def sanitize_ocr_text(text: str) -> str:
-    """Post-process VLM output: drop tables, synthetic quizzes, sign-offs, loops, and visual grounding coordinates."""
+    """Post-process VLM output: drop tables, synthetic quizzes, sign-offs, loops, and coordinates."""
     if not text:
         return ""
 
-    # Drop visual grounding bounding box coordinates like (25,47),(998,950) or [25, 47, 998, 950]
-    text = re.sub(r"\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\)\s*,\s*\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\)", "", text)
-    text = re.sub(r"\[\s*\d{1,4}\s*,\s*\d{1,4}\s*,\s*\d{1,4}\s*,\s*\d{1,4}\s*\]", "", text)
-    text = re.sub(r"<ref>.*?</ref>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<box>.*?</box>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<\|box_start\|>.*?<\|box_end\|>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<\|object_ref_start\|>.*?<\|object_ref_end\|>", "", text, flags=re.DOTALL)
+    text = _strip_coordinates_and_noise(text)
 
     # Drop Markdown tables and separator rows
     text = re.sub(r"(?:^[ \t]*\|[^\n]+\|[ \t]*(?:\r?\n|$))+", "\n", text, flags=re.MULTILINE)
@@ -332,23 +342,12 @@ class LocalGradingEngine:
             return sanitize_ocr_text(output.strip())
 
     def transcribe_images(self, image_paths: List[str], progress_cb=None) -> str:
-        """Digitize handwritten booklet pages verbatim (question papers are teacher-entered).
-
-        Uses a two-message structure (system + user roles) to enforce strict
-        verbatim OCR without visual grounding hallucinations or markdown tables.
-        """
-        system_prompt = (
-            "You are a strict verbatim Optical Character Recognition (OCR) engine. "
-            "You transcribe handwritten text exactly as written, without any additions, "
-            "corrections, summaries, or editorial changes."
-        )
-        user_prompt = (
-            "Transcribe the handwritten English text on this exam paper line by line.\n"
-            "CRITICAL RULES:\n"
-            "- Output ONLY the transcribed words.\n"
-            "- NEVER output bounding box coordinates, pixel coordinates, numbers in parentheses like (25,47),(998,950), or detection tags.\n"
-            "- Do NOT format as a Markdown table.\n"
-            "- If handwriting starts with a margin number like 'Q1] a]', include it at the start."
+        """Digitize handwritten booklet pages verbatim (question papers are teacher-entered)."""
+        prompt_text = (
+            "Read this handwritten exam page and write down all the handwritten English text line by line.\n"
+            "- Keep margin question numbers like 'Q1] a]', 'b)', '2] (b)', '3] a', '3b)' and headings intact.\n"
+            "- Do NOT output coordinates or numbers in parentheses like (25,47),(998,950).\n"
+            "- Do NOT output Markdown tables or extra commentary."
         )
         pages_md = []
         total = len(image_paths)
@@ -360,119 +359,52 @@ class LocalGradingEngine:
             print(f"[*] OCR Verbatim Processing Page {idx + 1}/{total}: {img_path}")
             messages = [
                 {
-                    "role": "system",
-                    "content": [{"type": "text", "text": system_prompt}],
-                },
-                {
                     "role": "user",
                     "content": [
                         {"type": "image", "image": img_path},
-                        {"type": "text", "text": user_prompt},
+                        {"type": "text", "text": prompt_text},
                     ],
-                },
+                }
             ]
             page_text = self._generate_text(
                 messages, max_tokens=1024, temperature=0.0, repetition_penalty=1.05
             )
+
+            # Fallback Retry: If page text after stripping coordinates is < 15 chars, retry once
+            clean_check = _strip_coordinates_and_noise(page_text)
+            if len(clean_check) < 15:
+                print(f"[*] Page {idx + 1} produced low text or coordinates only (<15 chars). Running fallback retry...")
+                retry_prompt = "Extract all handwritten words and sentences visible on this lined paper as plain text."
+                retry_messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": img_path},
+                            {"type": "text", "text": retry_prompt},
+                        ],
+                    }
+                ]
+                page_text = self._generate_text(
+                    retry_messages, max_tokens=1024, temperature=0.0, repetition_penalty=1.05
+                )
+
             pages_md.append(f"### Page {idx + 1}\n{page_text}")
         return "\n\n---\n\n".join(pages_md)
 
     def evaluate_answer(
         self,
         question_text: str,
-        max_marks: int,
+        max_marks: float,
         key_points: List[Union[Dict, str]],
         student_answer: str,
         verified_examples: Optional[List[Dict]] = None,
     ) -> Dict:
-        norm_points = []
-        default_w = round(float(max_marks) / max(len(key_points), 1), 2)
-        for item in key_points:
-            if isinstance(item, dict):
-                norm_points.append({"point": item["point"], "weight": float(item.get("weight", default_w))})
-            else:
-                norm_points.append({"point": str(item), "weight": default_w})
-
-        if not student_answer or len(student_answer.strip()) < 10:
-            return {
-                "matched_points": [],
-                "missing_points": [p["point"] for p in norm_points],
-                "ai_score": 0.0,
-                "ai_feedback": "No answer written or transcription is empty.",
-            }
-
-        rubric_numbered = "\n".join(
-            [f"{i + 1}. {p['point']} (Weight: {p['weight']} marks)" for i, p in enumerate(norm_points)]
+        """Evaluates student answer against rubric points using EduEval deterministic grader."""
+        from scorer import evaluate_with_edueval
+        return evaluate_with_edueval(
+            question_text=question_text,
+            max_marks=max_marks,
+            key_points=key_points,
+            student_answer=student_answer,
+            verified_examples=verified_examples,
         )
-
-        few_shot_block = ""
-        if verified_examples:
-            examples_str = []
-            for ex in verified_examples:
-                examples_str.append(
-                    f"- Past Student Answer: \"{ex['transcribed_text'][:200]}...\"\n"
-                    f"  Teacher Approved Score: {ex['teacher_score']} / {max_marks}\n"
-                    f"  Teacher Feedback: {ex['ai_feedback']}"
-                )
-            few_shot_block = "\nPast Teacher Grading Reference:\n" + "\n".join(examples_str) + "\n"
-
-        prompt = f"""You are a supportive university professor grading a handwritten Internal Assessment answer sheet.
-Ignore minor spelling or OCR transcription errors if the student's conceptual understanding is clear.
-
-Question: {question_text}
-Maximum Marks: {max_marks}
-
-Rubric Key Points:
-{rubric_numbered}
-{few_shot_block}
-Student's Handwritten Answer (OCR Transcribed):
-\"\"\"{student_answer}\"\"\"
-
-Instructions:
-1. Identify which rubric points (1 to {len(norm_points)}) the student has addressed (even if phrased in their own words).
-2. Award full or near-full marks if the student has written a detailed, structured answer covering multiple sub-points.
-3. Do NOT output Markdown tables. Do NOT invent extra quiz questions.
-Respond ONLY with a valid JSON object in this exact format:
-{{
-  "matched_indices": [1, 2, 3, 4],
-  "llm_suggested_score": 4.5,
-  "feedback": "Concise 2-sentence summary of strengths and any minor omissions."
-}}"""
-
-        messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-        raw_output = self._generate_text(messages, max_tokens=300, temperature=0.0, repetition_penalty=1.05)
-
-        matched_indices = []
-        llm_score = 0.0
-        feedback = "Evaluated against question rubric."
-
-        match = re.search(r"\{.*\}", raw_output, re.DOTALL)
-        if match:
-            try:
-                data = json.loads(match.group(0))
-                matched_indices = [int(i) for i in data.get("matched_indices", []) if str(i).isdigit()]
-                llm_score = float(data.get("llm_suggested_score", 0.0))
-                feedback = str(data.get("feedback", feedback))
-            except Exception:
-                feedback = f"Evaluated answer. Raw notes: {raw_output[:150]}"
-
-        matched_points = []
-        missing_points = []
-        weighted_score_sum = 0.0
-        for idx, item in enumerate(norm_points):
-            pt_num = idx + 1
-            if pt_num in matched_indices:
-                matched_points.append(item["point"])
-                weighted_score_sum += item["weight"]
-            else:
-                missing_points.append(item["point"])
-
-        final_score = max(weighted_score_sum, llm_score) if matched_indices else llm_score
-        final_score = round(min(max(final_score, 0.0), float(max_marks)) * 2) / 2
-
-        return {
-            "matched_points": matched_points,
-            "missing_points": missing_points,
-            "ai_score": final_score,
-            "ai_feedback": feedback,
-        }

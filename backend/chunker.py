@@ -1,8 +1,10 @@
+import os
 import re
 from typing import Dict, List, Optional, Set, Tuple
 from pathlib import Path
 
 import pymupdf as fitz
+from rapidfuzz import fuzz
 
 STOPWORDS = {
     "about", "after", "also", "and", "any", "are", "been", "briefly", "define",
@@ -174,35 +176,54 @@ def _match_orphan_subquestion(answer_text: str, sub_letter: str, rubrics: List[D
 
 
 def _semantic_heading_qid(line: str, rubrics: List[Dict]) -> Optional[str]:
-    """Match a standalone student heading against teacher-configured question keywords."""
+    """Match a standalone student heading against teacher-configured question rubrics using keyword overlap and RapidFuzz."""
+    raw_stripped = line.strip()
+    # Prose sentences ending with a period or comma are body text, never section headers
+    if raw_stripped.endswith(".") or raw_stripped.endswith(","):
+        return None
+
     stripped = re.sub(r"^[#>*\-\s]+", "", line).strip(" .:;-*_")
     word_count = len(stripped.split())
-    if word_count < 2 or word_count > 16:
+    if word_count < 2 or word_count > 12:
         return None
-    if re.match(r"^(?:page|internal assessment|usn|or)\b", stripped, re.I):
-        return None
-
-    line_words = keywords(stripped)
-    if not line_words or not rubrics:
+    if re.match(r"^(?:page|internal assessment|usn|or|marks|note)\b", stripped, re.I):
         return None
 
-    best_qid = None
-    best_score = 0
+    if not rubrics:
+        return None
+
     line_l = stripped.lower()
-    for r in rubrics:
-        q_text = r.get("question_text", "")
-        q_words = keywords(q_text)
-        overlap = len(line_words & q_words)
-        q_l = re.sub(r"\s+", " ", q_text.lower())
-        if line_l in q_l or q_l[:60] in line_l:
-            overlap += 4
-        if overlap > best_score:
-            best_score = overlap
-            best_qid = str(r["question_id"]).upper()
+    best_qid = None
+    best_ratio = 0.0
 
-    if best_score >= 2:
+    for r in rubrics:
+        qid = str(r.get("question_id", "")).upper()
+        if not re.match(r"^Q[1-3][A-B]$", qid):
+            continue
+        q_text = r.get("question_text", "")
+        ratio = fuzz.token_set_ratio(line_l, q_text.lower())
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_qid = qid
+
+    if best_ratio >= 65.0:
         return best_qid
     return None
+
+
+def merge_two_tier_margins(text: str) -> str:
+    """Pre-processes pages to merge adjacent two-tier margin lines: e.g. Q1]\\n a] -> \\nQ1A) , 1]\\n (a) -> \\nQ1A) , 2]\\n (6) -> \\nQ2B) """
+    def _repl(m):
+        q_num = m.group(1)
+        raw_sub = m.group(2).upper()
+        sub = "B" if raw_sub == "6" else raw_sub
+        return f"\nQ{q_num}{sub}) "
+
+    pattern = re.compile(
+        r"(?:^|\n)\s*(?:Q(?:uestion)?\.?\s*(?:No\.?)?\s*|Ans(?:wer)?\.?\s*)?([1-3])\s*[\]).:-]?\s*\n\s*[([]?\s*([a-dA-D6])\s*[)\]:.-]?\s*",
+        re.IGNORECASE,
+    )
+    return pattern.sub(_repl, text)
 
 
 def normalize_margin_markers(text: str) -> str:
@@ -252,21 +273,22 @@ def _best_unlabeled_qid(block: str, rubrics: List[Dict], used: List[str]) -> Opt
 def chunk_student_booklet(raw_markdown: str, rubrics: Optional[List[Dict]] = None) -> Dict[str, str]:
     """
     Hybrid boundary detection & multi-page continuation:
-      1. Regex-normalize OCR margin quirks (2] (6) -> Q2B, 36) -> Q3B, 3] a -> Q3A).
-      2. Split on explicit Q-markers, orphan a)/b), and standalone main questions.
-      3. Treat short standalone headings as semantic anchors against teacher questions.
-      4. Handle multi-page continuation markers (contd..., continued) seamlessly without
-         breaking or collapsing answers.
-    Never dump an entire multi-topic booklet into a fallback Q1A.
+      1. Merge two-tier margin markers across lines (Q1]\\n a] -> Q1A) ).
+      2. Regex-normalize OCR margin quirks (2] (6) -> Q2B, 36) -> Q3B, 3] a -> Q3A).
+      3. Track current_qid and transition standalone sub-letters (e.g. b] when current is Q1A -> Q1B).
+      4. Treat standalone headings as semantic anchors against active teacher questions using RapidFuzz.
+      5. Strictly validate all output keys to match ^Q[1-3][A-B]$ (never naked Q1 or Q2).
     """
     rubrics = rubrics or []
     text = clean_page_markers(raw_markdown)
     text = re.sub(r"^\s*\|?\s*Internal Assessment\s*[-–—]?\s*[I1V]+\s*\n?", "", text, flags=re.IGNORECASE)
+    text = merge_two_tier_margins(text)
     text = normalize_margin_markers(text)
 
     lines = text.splitlines()
     boundaries: List[Tuple[int, str]] = []
     last_main = None
+    current_qid = None
 
     for idx, raw_line in enumerate(lines):
         line = raw_line.strip()
@@ -275,8 +297,37 @@ def chunk_student_booklet(raw_markdown: str, rubrics: Optional[List[Dict]] = Non
 
         # Check if line is a generic continuation marker: "Contd...", "Continued", "(contd)"
         if re.match(r"^(?:#+\s*)?[([]?\s*(?:contd|continued|continuation)\b", line, re.IGNORECASE):
-            # It's an explicit continuation of the current question block, keep going
             continue
+
+        # Standalone Sub-Letter Transition: line starts with b), b], (b), (6), 6)
+        standalone_sub = re.match(
+            r"^(?:#+\s*)?(?:Ans(?:wer)?\.?\s*)?(?:[([]\s*([a-dA-D6])\s*[)\]]|([a-dA-D6])\s*[)\]:.-])(?:\s+|$)(.*)$",
+            line,
+            re.IGNORECASE,
+        )
+        if standalone_sub:
+            raw_let = (standalone_sub.group(1) or standalone_sub.group(2) or "A").upper()
+            sub_let = "B" if raw_let == "6" else raw_let
+            rest = (standalone_sub.group(3) or "").strip()
+
+            target_qid = None
+            if sub_let == "B" and current_qid and current_qid in {"Q1A", "Q2A", "Q3A"}:
+                target_qid = current_qid[:2] + "B"
+            elif last_main:
+                target_qid = f"Q{last_main}{sub_let}"
+            else:
+                target_qid = _match_orphan_subquestion(
+                    rest or " ".join(lines[idx : idx + 4]),
+                    sub_let,
+                    rubrics,
+                    [b[1] for b in boundaries],
+                )
+
+            if target_qid:
+                current_qid = target_qid
+                last_main = target_qid[1]
+                boundaries.append((idx, target_qid))
+                continue
 
         # Standalone main question marker (multi-tier parent): e.g. "Question 1", "Q1", "Q1]", "1]", "[1]", "Ans 1:", "Q.1", "1."
         main_only = re.match(
@@ -289,21 +340,27 @@ def chunk_student_booklet(raw_markdown: str, rubrics: Optional[List[Dict]] = Non
             last_main = main_only.group(1) or main_only.group(2) or main_only.group(3)
             continue
 
-        # Question + Sub-question or Sub-question alone (tier 2: e.g. "a]", "b)", "1a)", "Q1A)", "(6)")
+        # Question + Sub-question or Sub-question alone (tier 2: e.g. "1a)", "Q1A)", "Q2B)", "(a)", "a)")
         hm = re.match(
             r"^(?:#+\s*)?(?:Q(?:uestion)?\.?\s*(?:No\.?)?\s*|Ans(?:wer)?\.?\s*)?"
-            r"(?:([1-3])\s*[)\].\-\s]*[(\[]?\s*([a-dA-D6])\s*[)\].:\-\s]|([a-dA-D]|[([]?\s*6\s*[)\]])\s*[).:\]\-\s]?)\s*(.*)$",
+            r"(?:"
+            r"([1-3])\s*[)\].\-\s]*[([]?\s*([a-dA-D6])\s*[)\].:\-\s]|"
+            r"[([]\s*([a-dA-D6])\s*[)\]]\s*|"
+            r"([a-dA-D])\s*[)\]:.-]\s*"
+            r")\s*(.*)$",
             line,
             re.IGNORECASE,
         )
         if hm:
             q_num = hm.group(1)
-            raw_sub = hm.group(2) or hm.group(3) or "A"
+            raw_sub = hm.group(2) or hm.group(3) or hm.group(4) or "A"
             sub_let = "B" if raw_sub.strip("()[] ") == "6" else raw_sub.strip("()[] ").upper()
-            rest = (hm.group(4) or "").strip()
+            rest = (hm.group(5) or "").strip()
             if q_num:
                 last_main = q_num
                 qid = f"Q{q_num}{sub_let}"
+            elif current_qid and sub_let == "B" and current_qid in {"Q1A", "Q2A", "Q3A"}:
+                qid = current_qid[:2] + "B"
             elif last_main:
                 qid = f"Q{last_main}{sub_let}"
             else:
@@ -316,6 +373,7 @@ def chunk_student_booklet(raw_markdown: str, rubrics: Optional[List[Dict]] = Non
                 maybe_n = re.match(r"^Q(\d)", qid)
                 if maybe_n:
                     last_main = maybe_n.group(1)
+            current_qid = qid
             boundaries.append((idx, qid))
             continue
 
@@ -324,44 +382,77 @@ def chunk_student_booklet(raw_markdown: str, rubrics: Optional[List[Dict]] = Non
             maybe_n = re.match(r"^Q(\d)", semantic)
             if maybe_n:
                 last_main = maybe_n.group(1)
+            current_qid = semantic
             boundaries.append((idx, semantic))
 
     if not boundaries:
-        # No markers: score the whole text against every configured question and
-        # split by best unique keyword windows instead of collapsing to Q1A.
-        return _split_unlabeled_booklet(text, rubrics)
+        raw_chunks = _split_unlabeled_booklet(text, rubrics)
+    else:
+        raw_chunks = {}
+        for i, (line_idx, qid) in enumerate(boundaries):
+            start = line_idx
+            end = boundaries[i + 1][0] if i + 1 < len(boundaries) else len(lines)
+            block_lines = lines[start:end]
+            # Drop the heading line's marker; keep topical heading words.
+            if block_lines:
+                block_lines = [re.sub(
+                    r"^(?:#+\s*)?(?:Q(?:uestion)?\.?\s*(?:No\.?)?\s*|Ans(?:wer)?\.?\s*)?"
+                    r"(?:[1-3]\s*[)\].\-\s]*[(\[]?\s*[a-dA-D6]\s*[)\].:\-\s]|(?:[a-dA-D]|[([]?\s*6\s*[)\]])\s*[).:\]\-\s]?)\s*",
+                    "",
+                    block_lines[0],
+                    flags=re.IGNORECASE,
+                )] + block_lines[1:]
+            content = "\n".join(block_lines).strip()
+            if not content:
+                continue
+            if qid in raw_chunks:
+                raw_chunks[qid] += f"\n\n{content}"
+            else:
+                raw_chunks[qid] = content
 
-    chunks: Dict[str, str] = {}
-    for i, (line_idx, qid) in enumerate(boundaries):
-        start = line_idx
-        end = boundaries[i + 1][0] if i + 1 < len(boundaries) else len(lines)
-        block_lines = lines[start:end]
-        # Drop the heading line's marker; keep topical heading words.
-        if block_lines:
-            block_lines = [re.sub(
-                r"^(?:#+\s*)?(?:Q(?:uestion)?\.?\s*(?:No\.?)?\s*|Ans(?:wer)?\.?\s*)?"
-                r"(?:[1-3]\s*[)\].\-\s]*[(\[]?\s*[a-dA-D6]\s*[)\].:\-\s]|(?:[a-dA-D]|[([]?\s*6\s*[)\]])\s*[).:\]\-\s]?)\s*",
-                "",
-                block_lines[0],
-                flags=re.IGNORECASE,
-            )] + block_lines[1:]
-        content = "\n".join(block_lines).strip()
-        if not content:
-            continue
-        if qid in chunks:
-            chunks[qid] += f"\n\n{content}"
+        # Preamble before the first boundary: attach via keywords, not Q1A by default.
+        first_idx = boundaries[0][0]
+        preamble = "\n".join(lines[:first_idx]).strip()
+        if preamble and len(preamble) > 40:
+            pqid = _best_unlabeled_qid(preamble, rubrics, list(raw_chunks.keys()))
+            if pqid:
+                raw_chunks[pqid] = (preamble + "\n\n" + raw_chunks.get(pqid, "")).strip()
+
+    # Strict Key Validation: Never output naked keys like Q1, Q2, or Q3.
+    # Every key MUST match ^Q[1-3][A-B]$
+    valid_chunks: Dict[str, str] = {}
+    for k, v in raw_chunks.items():
+        k_clean = k.strip().upper()
+        if re.match(r"^Q[1-3][A-B]$", k_clean):
+            if k_clean in valid_chunks:
+                valid_chunks[k_clean] += "\n\n" + v
+            else:
+                valid_chunks[k_clean] = v
         else:
-            chunks[qid] = content
+            match_main = re.match(r"^Q?([1-3])$", k_clean)
+            target_main = match_main.group(1) if match_main else "1"
+            cand_a = f"Q{target_main}A"
+            cand_b = f"Q{target_main}B"
 
-    # Preamble before the first boundary: attach via keywords, not Q1A by default.
-    first_idx = boundaries[0][0]
-    preamble = "\n".join(lines[:first_idx]).strip()
-    if preamble and len(preamble) > 40:
-        pqid = _best_unlabeled_qid(preamble, rubrics, list(chunks.keys()))
-        if pqid:
-            chunks[pqid] = (preamble + "\n\n" + chunks.get(pqid, "")).strip()
+            text_a = ""
+            text_b = ""
+            for r in rubrics:
+                qid_r = str(r.get("question_id", "")).upper()
+                if qid_r == cand_a:
+                    text_a = r.get("question_text", "")
+                elif qid_r == cand_b:
+                    text_b = r.get("question_text", "")
 
-    return chunks
+            sim_a = fuzz.token_set_ratio(v.lower(), text_a.lower())
+            sim_b = fuzz.token_set_ratio(v.lower(), text_b.lower())
+
+            resolved_key = cand_a if sim_a >= sim_b else cand_b
+            if resolved_key in valid_chunks:
+                valid_chunks[resolved_key] += "\n\n" + v
+            else:
+                valid_chunks[resolved_key] = v
+
+    return valid_chunks
 
 
 def _split_unlabeled_booklet(text: str, rubrics: List[Dict]) -> Dict[str, str]:

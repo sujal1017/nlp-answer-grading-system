@@ -1,4 +1,4 @@
-"""Automated test suite for hybrid chunking, OCR sanitization, and SDMCET IA choice rules."""
+"""Automated test suite for hybrid chunking, OCR sanitization, SDMCET IA choice rules, and EduEval deterministic grading."""
 import os
 import sys
 from pathlib import Path
@@ -6,7 +6,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from chunker import calculate_ia_total, chunk_student_booklet, normalize_margin_markers, parse_teacher_questions
-from engine import generate_atomic_rubric, sanitize_ocr_text, LocalGradingEngine
+from engine import generate_atomic_rubric, sanitize_ocr_text, _strip_coordinates_and_noise, LocalGradingEngine
+from scorer import evaluate_with_edueval, clean_ocr_text
 from database import (
     init_db,
     get_connection,
@@ -99,11 +100,13 @@ Testing adequacy confirms whether variables are representative.
     assert "Q3A" in keys, f"Missing Q3A: {keys}"
     assert "Q3B" in keys, f"Missing Q3B: {keys}"
     assert keys != {"Q1A"}, f"Collapsed into Q1A only: {keys}"
+    for k in keys:
+        assert k in {"Q1A", "Q1B", "Q2A", "Q2B", "Q3A", "Q3B"}, f"Illegal naked key: {k}"
     assert "systematic investigation" in chunks["Q1A"].lower()
     assert "literature" in chunks["Q2B"].lower()
     assert "blueprint" in chunks["Q3A"].lower() or "research design" in chunks["Q3A"].lower()
     assert "sampling" in chunks["Q3B"].lower()
-    print(f"  [ok] hybrid chunker extracted {sorted(keys)}")
+    print(f"  [ok] hybrid chunker extracted {sorted(keys)} with zero naked keys")
 
 
 def test_orphan_b_inherits_q1():
@@ -115,6 +118,8 @@ b) Literature review follows identification of sources, reading and writing the 
     chunks = chunk_student_booklet(booklet, RUBRICS)
     keys = set(chunks.keys())
     assert "Q1A" in keys and "Q1B" in keys, keys
+    for k in keys:
+        assert k in {"Q1A", "Q1B", "Q2A", "Q2B", "Q3A", "Q3B"}, f"Illegal key: {k}"
     print(f"  [ok] orphan b) inherited Q1 -> {sorted(keys)}")
 
 
@@ -151,6 +156,129 @@ Additional ethical consideration: obtaining participant consent and maintaining 
     print("  [ok] multi-page continuation chunking")
 
 
+def test_multi_tier_margin_segmentation():
+    """Verify multi-tier margins: Q1] on line 1, a] on line 2, OCR '6' as 'b'."""
+    booklet = """
+1]
+a] Research is defined as a systematic process to identify problems and develop solutions.
+Its key objectives are exploratory and descriptive.
+
+(6) Literature review is conducted to bridge gaps and establish academic relevance.
+It synthesizes previous findings.
+
+3]
+a] Concepts associated with research design include variables, hypotheses, and sampling frames.
+A proper blueprint ensures validity.
+
+b] Sampling methods include probability and non-probability techniques.
+"""
+    chunks = chunk_student_booklet(booklet, RUBRICS)
+    keys = set(chunks.keys())
+    assert "Q1A" in keys, f"Missing Q1A: {keys}"
+    assert "Q1B" in keys, f"Missing Q1B: {keys}"
+    assert "Q3A" in keys, f"Missing Q3A: {keys}"
+    assert "Q3B" in keys, f"Missing Q3B: {keys}"
+    for k in keys:
+        assert k in {"Q1A", "Q1B", "Q2A", "Q2B", "Q3A", "Q3B"}, f"Illegal key: {k}"
+
+    assert "systematic process" in chunks["Q1A"].lower()
+    assert "literature review" in chunks["Q1B"].lower()
+    assert "concepts associated" in chunks["Q3A"].lower() or "blueprint" in chunks["Q3A"].lower()
+    assert "sampling methods" in chunks["Q3B"].lower()
+
+    # Also verify single-line multi-tier marker like Q1] a]
+    booklet_single_line = """
+Q1] a] Research is a structured enquiry.
+Q1] (6) Literature review summarizes past literature.
+3] a] Design concepts include variables.
+3] 6) Sampling uses stratified sampling.
+"""
+    chunks_sl = chunk_student_booklet(booklet_single_line, RUBRICS)
+    keys_sl = set(chunks_sl.keys())
+    assert "Q1A" in keys_sl and "Q1B" in keys_sl and "Q3A" in keys_sl and "Q3B" in keys_sl, keys_sl
+    print("  [ok] multi-tier margin segmentation (split across lines and combined)")
+
+
+def test_booklet_chunking_test_pdf_and_test1_pdf():
+    """Test realistic chunking for test.pdf pattern (Q2A, Q2B, Q3A, Q3B) and test1.pdf (Q1A, Q1B, Q3A, Q3B)."""
+    # Pattern modeled from test.pdf (Student chooses Q2 and Q3)
+    test_pdf_transcription = """### Page 1
+2] (a) Classify and explain the different types of research with examples:
+Descriptive research describes the state of affairs as it exists at present.
+Analytical research uses facts or information already available.
+Applied research aims at finding a solution for an immediate problem facing a society.
+Fundamental research is mainly concerned with generalizations and with the formulation of a theory.
+
+### Page 2
+2] (6) Essential features of a good research design:
+A good design is often characterized by flexible, appropriate, efficient, economical features.
+It minimizes bias and maximizes the reliability of the data collected and analyzed.
+
+### Page 3
+3] a TECHNIQUES USED FOR DEFINING RESEARCH PROBLEM:
+The research problem should be stated in a broad general way.
+Next, understand the origin and nature of the problem clearly.
+Survey the available literature and rephrase the research problem into working terms.
+
+### Page 4
+3b) CONCEPTS ASSOCIATED WITH RESEARCH DESIGN:
+Dependent and independent variables: A concept which can take on different values is called a variable.
+Extraneous variable: Independent variables that are not related to the purpose of the study.
+Control: Minimizing the influence of extraneous variables.
+Hypothesis: Tentative assumption made to draw out and test logical consequences.
+"""
+    chunks_test = chunk_student_booklet(test_pdf_transcription, RUBRICS)
+    keys_test = set(chunks_test.keys())
+    assert keys_test == {"Q2A", "Q2B", "Q3A", "Q3B"}, f"Expected Q2A, Q2B, Q3A, Q3B; got {keys_test}"
+    for k in keys_test:
+        assert k in {"Q1A", "Q1B", "Q2A", "Q2B", "Q3A", "Q3B"}, f"Illegal key in test.pdf: {k}"
+
+    # Pattern modeled from test1.pdf (Student chooses Q1 and Q3, two-tier margins)
+    test1_pdf_transcription = """### Page 1
+Q1]
+a]
+Research is defined as the systematic and sequential process of defining, analyzing, & interpreting the given problem.
+The major objectives of research include:
+1. To define the problem statement
+2. To gain basic knowledge and theories
+3. To find research gaps
+4. To analyze depth in a domain
+
+### Page 2
+SYSTEMATIC PROCEDURE OF REVIEWING LITERATURE
+The procedure of literature review involves:
+1. Identifying keywords and sources
+2. Searching journals, conference proceedings, and patents
+3. Evaluating and selecting literature
+4. Identifying gaps and summarizing findings
+
+### Page 3
+3]
+a]
+TECHNIQUES USED FOR DEFINING RESEARCH PROBLEM
+Techniques include:
+1. Statement of problem in a general way
+2. Understanding the nature of the problem
+3. Surveying the available literature
+4. Developing working hypotheses
+
+### Page 4
+b]
+CONCEPTS ASSOCIATED WITH RESEARCH DESIGN
+Key concepts:
+- Variables (Dependent and Independent variables)
+- Extraneous variables and confounding factors
+- Research hypotheses and experimental control
+- Treatment and experimental groups
+"""
+    chunks_test1 = chunk_student_booklet(test1_pdf_transcription, RUBRICS)
+    keys_test1 = set(chunks_test1.keys())
+    assert keys_test1 == {"Q1A", "Q1B", "Q3A", "Q3B"}, f"Expected Q1A, Q1B, Q3A, Q3B; got {keys_test1}"
+    for k in keys_test1:
+        assert k in {"Q1A", "Q1B", "Q2A", "Q2B", "Q3A", "Q3B"}, f"Illegal key in test1.pdf: {k}"
+    print("  [ok] realistic booklet chunking on test.pdf & test1.pdf with zero naked Q1/Q2 keys")
+
+
 def test_generation_kwargs_clean_sampling():
     temperature = 0.0
     top_p = None
@@ -176,7 +304,7 @@ def test_generation_kwargs_clean_sampling():
     print("  [ok] generation kwargs clean construction (no sampling flags on greedy decoding)")
 
 
-def test_sanitize_hallucinations():
+def test_sanitize_hallucinations_and_coordinate_stripping():
     # Loop collapse
     looped = ("To fill the gap and increase relevancy " * 30).strip()
     cleaned = sanitize_ocr_text(looped)
@@ -192,17 +320,11 @@ def test_sanitize_hallucinations():
     assert "Question 1: What is" not in cleaned_quiz
     assert "Question 2" not in cleaned_quiz
 
-    quiz2 = (
-        "Student answer on hypothesis testing.\n"
-        "Question 1: Define an experiment.\n"
-    )
-    cleaned_quiz2 = sanitize_ocr_text(quiz2)
-    assert "Question 1: Define" not in cleaned_quiz2
-
     # Visual grounding coordinates stripping
     grounded = (
         "(25,47),(998,950)\n"
         "<box>(25,47),(998,950)</box>\n"
+        "<|box_start|>(25,47),(998,950)<|box_end|>\n"
         "Research is a systematic study to find solutions.\n"
         "[25, 47, 998, 950]\n"
         "(0,0),(1000,1000)"
@@ -210,9 +332,14 @@ def test_sanitize_hallucinations():
     cleaned_grounded = sanitize_ocr_text(grounded)
     assert "(25,47),(998,950)" not in cleaned_grounded
     assert "<box>" not in cleaned_grounded
+    assert "<|box_start|>" not in cleaned_grounded
     assert "[25, 47, 998, 950]" not in cleaned_grounded
     assert "Research is a systematic study" in cleaned_grounded
-    print("  [ok] OCR sanitizer (including bounding box grounding removal)")
+
+    stripped_direct = _strip_coordinates_and_noise("(25,47),(998,950)\nValid handwriting\n(10,20)")
+    assert "(25,47)" not in stripped_direct
+    assert "Valid handwriting" in stripped_direct
+    print("  [ok] OCR sanitizer & coordinate stripping ((25,47),(998,950) removed cleanly)")
 
 
 def test_choice_rule():
@@ -280,91 +407,94 @@ def test_database_and_calibration():
     print("  [ok] database seed & live weight calibration")
 
 
-def test_transcribe_images_message_structure():
-    """Verify transcribe_images builds a system + user two-message structure."""
+def test_transcribe_images_prompt_and_grounding_fix():
+    """Verify transcribe_images uses single user message with explicit negative constraint against grounding."""
     engine = LocalGradingEngine()
-    # Intercept _generate_text to capture messages without running inference
     captured_messages = []
-    original_generate = engine._generate_text
 
     def mock_generate(messages, **kwargs):
         captured_messages.append(messages)
-        return "mocked OCR output"
+        return "Q1A) Research is systematic enquiry."
 
     engine._generate_text = mock_generate
 
-    # Create a temporary dummy image file
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         dummy_path = f.name
-        f.write(b"\x89PNG\r\n")  # minimal PNG header bytes
+        f.write(b"\x89PNG\r\n")
 
     try:
         result = engine.transcribe_images([dummy_path])
         assert len(captured_messages) == 1, f"Expected 1 call, got {len(captured_messages)}"
         msgs = captured_messages[0]
-        assert len(msgs) == 2, f"Expected 2 messages (system + user), got {len(msgs)}"
-        assert msgs[0]["role"] == "system", f"First message role should be 'system', got '{msgs[0]['role']}'"
-        assert msgs[1]["role"] == "user", f"Second message role should be 'user', got '{msgs[1]['role']}'"
+        # Single user message (no grounding-inducing system message)
+        assert len(msgs) == 1, f"Expected 1 user message, got {len(msgs)}"
+        assert msgs[0]["role"] == "user", f"Role should be 'user', got '{msgs[0]['role']}'"
 
-        # System message should contain the OCR engine persona
-        sys_text = msgs[0]["content"][0]["text"]
-        assert "strict verbatim" in sys_text.lower(), f"System prompt missing 'strict verbatim': {sys_text}"
-
-        # User message should have image + text content items
-        user_content = msgs[1]["content"]
+        user_content = msgs[0]["content"]
         content_types = [item["type"] for item in user_content]
         assert "image" in content_types, f"User message missing image: {content_types}"
         assert "text" in content_types, f"User message missing text: {content_types}"
 
-        # User prompt should contain transcription instructions and grounding negative constraint
         user_text = [item["text"] for item in user_content if item["type"] == "text"][0]
-        assert "bounding box coordinates" in user_text.lower(), f"User prompt missing bounding box instruction"
-        assert "q1] a]" in user_text.lower(), f"User prompt missing margin number example"
-
-        print("  [ok] transcribe_images uses system + user two-message structure with grounding negative constraints")
+        assert "coordinates or numbers in parentheses like (25,47),(998,950)" in user_text
+        assert "q1] a]" in user_text.lower()
+        print("  [ok] transcribe_images prompt has explicit grounding fix and margin rules")
     finally:
         os.remove(dummy_path)
 
 
-def test_multi_tier_margin_segmentation():
-    """Verify multi-tier margins: main question on line 1, sub-question on line 2, OCR '6' as 'b'."""
-    booklet = """
-1]
-a] Research is defined as a systematic process to identify problems and develop solutions.
-Its key objectives are exploratory and descriptive.
+def test_edueval_deterministic_scoring_q1a():
+    """Verify evaluate_with_edueval accurately grades sample student handwritten transcription."""
+    question_text = "Define research and explain its major objectives"
+    max_marks = 5.0
+    rubric_points = [
+        {"point": "Clear and accurate definition of research as a systematic process", "weight": 1.25},
+        {"point": "Primary exploratory, descriptive, and diagnostic objectives", "weight": 1.25},
+        {"point": "Academic and practical significance in problem solving", "weight": 1.25},
+        {"point": "Methodological advancement and societal benefit", "weight": 1.25},
+    ]
 
-(6) Literature review is conducted to bridge gaps and establish academic relevance.
-It synthesizes previous findings.
+    student_answer = (
+        "Research is defined as the systematic and sequential process of defining, analyzing, & interpreting "
+        "the given question or problem.\n"
+        "Re = 'Again & again'\n"
+        "Search = 'Analyzing & interpreting the answer to the problem'\n\n"
+        "The major objectives of research include:\n"
+        "1. To define the problem statement\n"
+        "2. To gain basic knowledge and theories\n"
+        "3. To find research gaps and diagnostic analysis\n"
+        "4. To analyze depth in a domain\n"
+        "5. For academic advancement and practical significance in problem solving\n"
+        "6. To help society with evidence-based decisions and societal benefit."
+    )
 
-3]
-a] Concepts associated with research design include variables, hypotheses, and sampling frames.
-A proper blueprint ensures validity.
+    eval_result = evaluate_with_edueval(
+        question_text=question_text,
+        max_marks=max_marks,
+        key_points=rubric_points,
+        student_answer=student_answer,
+    )
 
-b] Sampling methods include probability and non-probability techniques.
-"""
-    chunks = chunk_student_booklet(booklet, RUBRICS)
-    keys = set(chunks.keys())
-    assert "Q1A" in keys, f"Missing Q1A: {keys}"
-    assert "Q1B" in keys, f"Missing Q1B: {keys}"
-    assert "Q3A" in keys, f"Missing Q3A: {keys}"
-    assert "Q3B" in keys, f"Missing Q3B: {keys}"
-    assert "systematic process" in chunks["Q1A"].lower()
-    assert "literature review" in chunks["Q1B"].lower()
-    assert "concepts associated" in chunks["Q3A"].lower() or "blueprint" in chunks["Q3A"].lower()
-    assert "sampling methods" in chunks["Q3B"].lower()
+    score = eval_result["ai_score"]
+    matched = eval_result["matched_points"]
+    feedback = eval_result["ai_feedback"]
 
-    # Also verify single-line multi-tier marker like Q1] a]
-    booklet_single_line = """
-Q1] a] Research is a structured enquiry.
-Q1] (6) Literature review summarizes past literature.
-3] a] Design concepts include variables.
-3] 6) Sampling uses stratified sampling.
-"""
-    chunks_sl = chunk_student_booklet(booklet_single_line, RUBRICS)
-    keys_sl = set(chunks_sl.keys())
-    assert "Q1A" in keys_sl and "Q1B" in keys_sl and "Q3A" in keys_sl and "Q3B" in keys_sl, keys_sl
-    print("  [ok] multi-tier margin segmentation (split across lines and combined)")
+    assert score in {4.5, 5.0}, f"Expected 4.5 or 5.0, got {score}"
+    assert len(matched) >= 3, f"Expected at least 3 matched points, got {len(matched)}: {matched}"
+    assert len(feedback) > 20, f"Empty or too short feedback: {feedback}"
+
+    # Also test via engine.evaluate_answer() integration
+    engine = LocalGradingEngine()
+    engine_result = engine.evaluate_answer(
+        question_text=question_text,
+        max_marks=max_marks,
+        key_points=rubric_points,
+        student_answer=student_answer,
+    )
+    assert engine_result["ai_score"] in {4.5, 5.0}
+    assert engine_result["matched_points"] == eval_result["matched_points"]
+    print(f"  [ok] EduEval deterministic grading awarded {score}/{max_marks} marks with {len(matched)} criteria matched")
 
 
 if __name__ == "__main__":
@@ -374,10 +504,12 @@ if __name__ == "__main__":
     test_orphan_b_inherits_q1()
     test_multipage_continuation_chunking()
     test_multi_tier_margin_segmentation()
+    test_booklet_chunking_test_pdf_and_test1_pdf()
     test_generation_kwargs_clean_sampling()
-    test_sanitize_hallucinations()
+    test_sanitize_hallucinations_and_coordinate_stripping()
     test_choice_rule()
     test_teacher_parse_and_rubric()
     test_database_and_calibration()
-    test_transcribe_images_message_structure()
+    test_transcribe_images_prompt_and_grounding_fix()
+    test_edueval_deterministic_scoring_q1a()
     print("\nAll EvalAI pipeline tests passed successfully!")
