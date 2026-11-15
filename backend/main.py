@@ -11,24 +11,32 @@ from pydantic import BaseModel, Field
 
 from chunker import (
     calculate_ia_total,
-    chunk_student_booklet,
     convert_pdf_to_images,
     parse_teacher_questions,
 )
 from database import (
     BACKEND_DIR,
     DATA_DIR,
+    assign_segment_to_question,
     create_exam,
+    delete_all_student_submissions,
     delete_exam_rubrics,
+    delete_student_submission,
     get_all_exams,
     get_exam,
+    get_exam_booklets,
     get_exam_rubrics,
     get_exam_submissions,
     get_kpi_counts,
+    get_raw_booklet,
     get_verified_examples,
     init_db,
+    merge_and_reassign_submissions,
     save_question_rubric,
+    save_raw_booklet,
     save_student_answer,
+    split_at_cursor,
+    split_submission,
     update_evaluation,
     update_rubric_weights_from_feedback,
     verify_submission,
@@ -100,6 +108,46 @@ class SampleGradeIn(BaseModel):
     student_id: str = "2SD23CS082"
     sample_name: str = "test1.pdf"
     max_pages: Optional[int] = None
+
+
+class MergeReassignRequest(BaseModel):
+    exam_id: str
+    student_id: str
+    source_question_ids: List[str]
+    target_question_id: str
+
+
+class SplitRequest(BaseModel):
+    exam_id: str
+    student_id: str
+    source_question_id: str
+    target_question_id: str
+    split_index: int
+    current_text: Optional[str] = None
+
+
+class EvaluateStudentRequest(BaseModel):
+    exam_id: str
+    student_id: str
+    question_id: Optional[str] = None
+
+
+class AssignSegmentRequest(BaseModel):
+    exam_id: str
+    student_id: str
+    question_id: str
+    start_char: Optional[int] = None
+    end_char: Optional[int] = None
+    custom_text: Optional[str] = None
+    remove_from_unassigned: bool = True
+
+
+class SplitAtCursorRequest(BaseModel):
+    exam_id: str
+    student_id: str
+    source_question_id: str
+    cursor_index: int
+    target_question_id: str
 
 
 def public_file_url(path: str) -> str:
@@ -200,8 +248,282 @@ def exam_submissions(exam_id: str, student_id: Optional[str] = None):
     rows = get_exam_submissions(exam_id, student_id)
     for row in rows:
         row["image_urls"] = [public_file_url(p) for p in row.get("image_paths", [])]
-    students = sorted({r["student_id"] for r in rows})
+
+    # Include students from both submissions and digitized booklets
+    booklets = get_exam_booklets(exam_id)
+    all_student_ids = set([r["student_id"] for r in rows] + [b["student_id"] for b in booklets])
+    students = sorted(all_student_ids)
+
     return {"students": students, "submissions": rows}
+
+
+@app.get("/api/booklets/{exam_id}/{student_id}")
+def get_booklet_detail(exam_id: str, student_id: str):
+    eid = exam_id.strip().upper()
+    sid = student_id.strip().upper()
+    raw_booklet = get_raw_booklet(eid, sid)
+    subs = get_exam_submissions(eid, sid)
+    for row in subs:
+        row["image_urls"] = [public_file_url(p) for p in row.get("image_paths", [])]
+    scores = {r["question_id"]: float(r["teacher_score"] or r["ai_score"] or 0.0) for r in subs}
+    ia_breakdown = calculate_ia_total(scores)
+
+    booklet_dict = None
+    if raw_booklet:
+        booklet_dict = {
+            **raw_booklet,
+            "image_urls": [public_file_url(p) for p in raw_booklet.get("image_paths", [])],
+        }
+
+    return {
+        "booklet": booklet_dict,
+        "submissions": subs,
+        "ia_total": ia_breakdown["ia_total"],
+        "ia_breakdown": ia_breakdown,
+    }
+
+
+@app.post("/api/submissions/upload")
+async def upload_booklet(
+    exam_id: str = Form(...),
+    student_id: str = Form(...),
+    files: List[UploadFile] = File(...),
+):
+    eid = exam_id.strip().upper()
+    sid = student_id.strip().upper()
+    if not eid or not sid:
+        raise HTTPException(400, "exam_id and student_id are required")
+    if not files:
+        raise HTTPException(400, "Upload at least one booklet PDF or image")
+
+    student_dir = DATA_DIR / "booklets" / eid / sid
+    student_dir.mkdir(parents=True, exist_ok=True)
+    page_paths = []
+    img_idx = 0
+    for upload in files:
+        raw = await upload.read()
+        name = (upload.filename or "page.bin").lower()
+        if name.endswith(".pdf"):
+            page_paths.extend(convert_pdf_to_images(raw, str(student_dir)))
+        else:
+            img_idx += 1
+            ext = Path(name).suffix or ".png"
+            dest = student_dir / f"page_{img_idx}{ext}"
+            dest.write_bytes(raw)
+            page_paths.append(str(dest))
+
+    # Step 1: Run Qwen2-VL verbatim OCR across all pages (no automatic chunking)
+    full_booklet_text = engine.transcribe_images(page_paths, auto_unload=True)
+
+    relative_paths = []
+    for p in page_paths:
+        try:
+            rel = Path(p).resolve().relative_to(DATA_DIR.resolve()).as_posix()
+            relative_paths.append(rel)
+        except Exception:
+            relative_paths.append(p)
+
+    # Delete any previous submissions so re-upload starts fresh
+    delete_all_student_submissions(eid, sid)
+    # Save entire OCR text directly into Q1A
+    save_student_answer(eid, sid, "Q1A", relative_paths, full_booklet_text)
+    save_raw_booklet(eid, sid, relative_paths, full_booklet_text)
+    engine.unload_model()
+
+    return {
+        "status": "transcribed",
+        "student_id": sid,
+        "question_id": "Q1A",
+        "pages": len(page_paths),
+        "text": full_booklet_text,
+        "image_urls": [public_file_url(p) for p in relative_paths],
+    }
+
+
+@app.post("/api/submissions/split")
+def split_submission_endpoint(payload: SplitRequest):
+    """
+    Step 2: Cursor Splitting & Question Assignment in Tab 3:
+      - split_index == 0: Moves entire text of source_question_id to target_question_id,
+        and deletes the empty source_question_id card!
+      - split_index > 0: Keeps text[:split_index] in source_question_id and moves
+        text[split_index:] to target_question_id.
+    """
+    eid = payload.exam_id.strip().upper()
+    sid = payload.student_id.strip().upper()
+    source_qid = payload.source_question_id.strip().upper()
+    target_qid = payload.target_question_id.strip().upper()
+
+    if payload.split_index is None or payload.split_index < 0:
+        raise HTTPException(400, "Invalid split_index. Must be >= 0.")
+
+    subs = get_exam_submissions(eid, sid)
+    source_sub = next((s for s in subs if s["question_id"].upper() == source_qid), None)
+    if not source_sub:
+        raise HTTPException(404, f"Source question '{source_qid}' not found for student '{sid}'")
+
+    image_paths = source_sub.get("image_paths", [])
+    text_to_split = (
+        payload.current_text
+        if payload.current_text is not None
+        else (source_sub.get("transcribed_text") or "")
+    )
+
+    # Case A: split_index == 0 or text_to_split[:split_index].strip() == ""
+    # The entire text moves to target_question_id, and source_question_id is deleted.
+    if payload.split_index == 0 or not text_to_split[:payload.split_index].strip():
+        target_text = text_to_split.strip()
+        save_student_answer(eid, sid, target_qid, image_paths, target_text)
+        if target_qid != source_qid:
+            delete_student_submission(eid, sid, source_qid)
+    else:
+        # Case B: split_index > 0
+        first_part = text_to_split[:payload.split_index].strip()
+        second_part = text_to_split[payload.split_index:].strip()
+        save_student_answer(eid, sid, source_qid, image_paths, first_part)
+        save_student_answer(eid, sid, target_qid, image_paths, second_part)
+
+    updated_subs = get_exam_submissions(eid, sid)
+    for row in updated_subs:
+        row["image_urls"] = [public_file_url(p) for p in row.get("image_paths", [])]
+    scores = {r["question_id"]: float(r["teacher_score"] or r["ai_score"] or 0.0) for r in updated_subs}
+    ia_breakdown = calculate_ia_total(scores)
+
+    return {
+        "status": "success",
+        "submissions": updated_subs,
+        "ia_total": ia_breakdown["ia_total"],
+        "ia_breakdown": ia_breakdown,
+    }
+
+
+@app.post("/api/submissions/evaluate-student")
+def evaluate_student_endpoint(payload: EvaluateStudentRequest):
+    """
+    Step 3: Evaluate All Assigned Questions Against Rubrics using EduEval:
+      - Runs evaluate_with_edueval against question rubrics for all assigned cards
+        (or single card if question_id is provided).
+      - Updates matched_points, missing_points, ai_score, and ai_feedback.
+      - Returns updated submissions and live SDMCET IA Choice Rule Total (max(Q1, Q2) + Q3).
+    """
+    eid = payload.exam_id.strip().upper()
+    sid = payload.student_id.strip().upper()
+    rubrics = get_exam_rubrics(eid)
+    rubric_map = {r["question_id"].upper(): r for r in rubrics}
+
+    subs = get_exam_submissions(eid, sid)
+    if payload.question_id:
+        target_q = payload.question_id.strip().upper()
+        subs_to_eval = [s for s in subs if s["question_id"].upper() == target_q]
+    else:
+        subs_to_eval = subs
+
+    for s in subs_to_eval:
+        q_id = s["question_id"].upper()
+        ans_text = s.get("transcribed_text") or ""
+        if q_id in rubric_map:
+            r_info = rubric_map[q_id]
+            past = get_verified_examples(eid, q_id, limit=2)
+            eval_res = engine.evaluate_answer(
+                question_text=r_info["question_text"],
+                max_marks=r_info["max_marks"],
+                key_points=r_info["key_points"],
+                student_answer=ans_text,
+                verified_examples=past,
+            )
+            update_evaluation(
+                exam_id=eid,
+                student_id=sid,
+                question_id=q_id,
+                matched_points=eval_res["matched_points"],
+                missing_points=eval_res["missing_points"],
+                ai_score=eval_res["ai_score"],
+                ai_feedback=eval_res["ai_feedback"],
+            )
+
+    updated_subs = get_exam_submissions(eid, sid)
+    for row in updated_subs:
+        row["image_urls"] = [public_file_url(p) for p in row.get("image_paths", [])]
+    scores = {r["question_id"]: float(r["teacher_score"] or r["ai_score"] or 0.0) for r in updated_subs}
+    ia_breakdown = calculate_ia_total(scores)
+
+    return {
+        "status": "success",
+        "submissions": updated_subs,
+        "ia_total": ia_breakdown["ia_total"],
+        "ia_breakdown": ia_breakdown,
+    }
+
+
+@app.post("/api/submissions/assign-segment")
+def assign_segment(payload: AssignSegmentRequest):
+    try:
+        res = assign_segment_to_question(
+            exam_id=payload.exam_id,
+            student_id=payload.student_id,
+            question_id=payload.question_id,
+            start_char=payload.start_char,
+            end_char=payload.end_char,
+            custom_text=payload.custom_text,
+            remove_from_unassigned=payload.remove_from_unassigned,
+        )
+        for row in res["submissions"]:
+            row["image_urls"] = [public_file_url(p) for p in row.get("image_paths", [])]
+        if res.get("booklet"):
+            res["booklet"]["image_urls"] = [public_file_url(p) for p in res["booklet"].get("image_paths", [])]
+        return res
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"Assignment failed: {exc}")
+
+
+@app.post("/api/submissions/split-at-cursor")
+def split_at_cursor_endpoint(payload: SplitAtCursorRequest):
+    try:
+        res = split_at_cursor(
+            exam_id=payload.exam_id,
+            student_id=payload.student_id,
+            source_question_id=payload.source_question_id,
+            cursor_index=payload.cursor_index,
+            target_question_id=payload.target_question_id,
+        )
+        for row in res["submissions"]:
+            row["image_urls"] = [public_file_url(p) for p in row.get("image_paths", [])]
+        return res
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"Split at cursor failed: {exc}")
+
+
+@app.delete("/api/submissions/{exam_id}/{student_id}/{question_id}")
+def delete_submission_endpoint(exam_id: str, student_id: str, question_id: str):
+    try:
+        res = delete_student_submission(exam_id, student_id, question_id)
+        for row in res["submissions"]:
+            row["image_urls"] = [public_file_url(p) for p in row.get("image_paths", [])]
+        return res
+    except Exception as exc:
+        raise HTTPException(500, f"Delete failed: {exc}")
+
+
+@app.post("/api/submissions/merge-reassign")
+def merge_reassign(payload: MergeReassignRequest):
+    try:
+        res = merge_and_reassign_submissions(
+            exam_id=payload.exam_id,
+            student_id=payload.student_id,
+            source_question_ids=payload.source_question_ids,
+            target_question_id=payload.target_question_id,
+        )
+        for row in res["submissions"]:
+            row["image_urls"] = [public_file_url(p) for p in row.get("image_paths", [])]
+        return res
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"Merge failed: {exc}")
 
 
 @app.get("/api/sample-booklets")
@@ -223,22 +545,13 @@ def _run_grade_job(job_id: str, exam_id: str, student_id: str, page_paths: List[
     job = jobs[job_id]
     try:
         with grade_lock:
-            rubrics = get_exam_rubrics(exam_id)
-            if not rubrics:
-                raise RuntimeError("No questions configured for this exam.")
-
             def progress(msg: str):
                 job["progress"] = msg
 
             job["status"] = "running"
             job["progress"] = "Starting booklet digitization with Qwen2-VL"
-            full_md = engine.transcribe_images(page_paths, progress_cb=progress)
+            full_md = engine.transcribe_images(page_paths, progress_cb=progress, auto_unload=True)
             job["transcript"] = full_md
-
-            job["progress"] = "Segmenting answers with hybrid boundary detection"
-            chunks = chunk_student_booklet(full_md, rubrics=rubrics)
-            if not chunks:
-                raise RuntimeError("Could not segment the booklet into questions.")
 
             relative_paths = []
             for p in page_paths:
@@ -248,40 +561,17 @@ def _run_grade_job(job_id: str, exam_id: str, student_id: str, page_paths: List[
                 except Exception:
                     relative_paths.append(p)
 
-            rubric_map = {r["question_id"].upper(): r for r in rubrics}
-            results = []
-            for q_id, ans_text in chunks.items():
-                job["progress"] = f"Grading {q_id}"
-                save_student_answer(exam_id, student_id, q_id, relative_paths, ans_text)
-                if q_id in rubric_map:
-                    r_info = rubric_map[q_id]
-                    past = get_verified_examples(exam_id, q_id, limit=2)
-                    eval_res = engine.evaluate_answer(
-                        question_text=r_info["question_text"],
-                        max_marks=r_info["max_marks"],
-                        key_points=r_info["key_points"],
-                        student_answer=ans_text,
-                        verified_examples=past,
-                    )
-                    update_evaluation(
-                        exam_id=exam_id,
-                        student_id=student_id,
-                        question_id=q_id,
-                        matched_points=eval_res["matched_points"],
-                        missing_points=eval_res["missing_points"],
-                        ai_score=eval_res["ai_score"],
-                        ai_feedback=eval_res["ai_feedback"],
-                    )
-                    results.append({"question_id": q_id, **eval_res})
-                else:
-                    results.append({"question_id": q_id, "ai_score": None, "ai_feedback": "No matching rubric."})
+            # Reset previous submissions so re-grading starts fresh with all text dumped into Q1A
+            delete_all_student_submissions(exam_id, student_id)
+            save_student_answer(exam_id, student_id, "Q1A", relative_paths, full_md)
+            save_raw_booklet(exam_id, student_id, relative_paths, full_md)
+            engine.unload_model()
 
-            scores = {r["question_id"]: float(r.get("ai_score") or 0) for r in results if r.get("ai_score") is not None}
-            job["ia"] = calculate_ia_total(scores)
-            job["chunks"] = list(chunks.keys())
-            job["results"] = results
+            job["chunks"] = ["Q1A"]
+            job["results"] = [{"question_id": "Q1A", "status": "Transcribed", "ai_score": 0.0}]
+            job["ia"] = calculate_ia_total({"Q1A": 0.0})
             job["status"] = "done"
-            job["progress"] = "Evaluation complete"
+            job["progress"] = "OCR complete: Full booklet transcribed into Q1A (ready for teacher cursor split)"
     except Exception as exc:
         job["status"] = "error"
         job["error"] = str(exc)

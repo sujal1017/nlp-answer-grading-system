@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 BACKEND_DIR = Path(__file__).resolve().parent
 DB_NAME = str(BACKEND_DIR / "grading_system.db")
@@ -164,6 +164,19 @@ def seed_default_exam(conn):
                 ),
             ]
 
+            full_sample_text = "\n\n--- Page 1 ---\n\n".join(
+                f"Question {qid}\n{text}" for qid, text, *_ in sample_subs
+            )
+
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO booklets (
+                    exam_id, student_id, image_paths, full_transcribed_text
+                ) VALUES (?, '2SD23CS082', ?, ?)
+                """,
+                (exam_id, json.dumps(image_rel_paths), full_sample_text),
+            )
+
             for qid, text, matched, missing, ai_sc, fb, tch_sc, tch_vf in sample_subs:
                 cursor.execute(
                     """
@@ -227,6 +240,21 @@ def init_db():
 
     cursor.execute(
         """
+        CREATE TABLE IF NOT EXISTS booklets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exam_id TEXT NOT NULL,
+            student_id TEXT NOT NULL,
+            image_paths TEXT NOT NULL,
+            full_transcribed_text TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(exam_id, student_id),
+            FOREIGN KEY(exam_id) REFERENCES exams(exam_id)
+        )
+        """
+    )
+
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS submissions (
             submission_id INTEGER PRIMARY KEY AUTOINCREMENT,
             exam_id TEXT NOT NULL,
@@ -236,7 +264,7 @@ def init_db():
             transcribed_text TEXT,
             matched_points TEXT,
             missing_points TEXT,
-            ai_score REAL,
+            ai_score REAL DEFAULT 0.0,
             ai_feedback TEXT,
             teacher_score REAL,
             teacher_verified INTEGER DEFAULT 0,
@@ -335,7 +363,108 @@ def get_exam_rubrics(exam_id: str) -> List[Dict]:
     return result
 
 
-def save_student_answer(exam_id: str, student_id: str, question_id: str, image_paths: List[str], transcribed_text: str):
+def save_raw_booklet(exam_id: str, student_id: str, image_paths: List[str], full_transcribed_text: str):
+    eid = exam_id.strip().upper()
+    sid = student_id.strip().upper()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO booklets (exam_id, student_id, image_paths, full_transcribed_text)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(exam_id, student_id) DO UPDATE SET
+            image_paths = excluded.image_paths,
+            full_transcribed_text = excluded.full_transcribed_text
+        """,
+        (eid, sid, json.dumps(image_paths), full_transcribed_text),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_raw_booklet(exam_id: str, student_id: str) -> Optional[Dict]:
+    eid = exam_id.strip().upper()
+    sid = student_id.strip().upper()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM booklets WHERE exam_id=? AND student_id=?",
+        (eid, sid),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    item = dict(row)
+    item["image_paths"] = json.loads(item["image_paths"]) if item["image_paths"] else []
+    return item
+
+
+def get_exam_booklets(exam_id: str) -> List[Dict]:
+    eid = exam_id.strip().upper()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM booklets WHERE exam_id=? ORDER BY student_id ASC",
+        (eid,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        item = dict(r)
+        item["image_paths"] = json.loads(item["image_paths"]) if item["image_paths"] else []
+        result.append(item)
+    return result
+
+
+def delete_student_submission(exam_id: str, student_id: str, question_id: str) -> Dict[str, Any]:
+    eid = exam_id.strip().upper()
+    sid = student_id.strip().upper()
+    qid = question_id.strip().upper()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM submissions WHERE exam_id=? AND student_id=? AND question_id=?",
+        (eid, sid, qid),
+    )
+    conn.commit()
+    conn.close()
+
+    from chunker import calculate_ia_total
+    updated_subs = get_exam_submissions(eid, sid)
+    scores = {r["question_id"]: float(r["teacher_score"] or r["ai_score"] or 0.0) for r in updated_subs}
+    ia_breakdown = calculate_ia_total(scores)
+
+    return {
+        "status": "success",
+        "submissions": updated_subs,
+        "ia_total": ia_breakdown["ia_total"],
+        "ia_breakdown": ia_breakdown,
+    }
+
+
+def delete_all_student_submissions(exam_id: str, student_id: str):
+    eid = exam_id.strip().upper()
+    sid = student_id.strip().upper()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM submissions WHERE exam_id=? AND student_id=?",
+        (eid, sid),
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_student_answer(
+    exam_id: str,
+    student_id: str,
+    question_id: str,
+    image_paths: List[str],
+    transcribed_text: str,
+    ai_score: float = 0.0,
+):
     eid = exam_id.strip().upper()
     sid = student_id.strip().upper()
     qid = question_id.strip().upper()
@@ -343,15 +472,16 @@ def save_student_answer(exam_id: str, student_id: str, question_id: str, image_p
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO submissions (exam_id, student_id, question_id, image_paths, transcribed_text, status)
-        VALUES (?, ?, ?, ?, ?, 'Transcribed')
+        INSERT INTO submissions (exam_id, student_id, question_id, image_paths, transcribed_text, ai_score, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'Transcribed')
         ON CONFLICT(exam_id, student_id, question_id) DO UPDATE SET
             image_paths = excluded.image_paths,
             transcribed_text = excluded.transcribed_text,
+            ai_score = excluded.ai_score,
             status = 'Transcribed',
             teacher_verified = 0
         """,
-        (eid, sid, qid, json.dumps(image_paths), transcribed_text),
+        (eid, sid, qid, json.dumps(image_paths), transcribed_text, ai_score),
     )
     conn.commit()
     conn.close()
@@ -442,6 +572,7 @@ def get_exam_submissions(exam_id: str, student_id: Optional[str] = None) -> List
         item["image_paths"] = json.loads(item["image_paths"]) if item["image_paths"] else []
         item["matched_points"] = json.loads(item["matched_points"]) if item["matched_points"] else []
         item["missing_points"] = json.loads(item["missing_points"]) if item["missing_points"] else []
+        item["ai_score"] = float(item["ai_score"]) if item.get("ai_score") is not None else 0.0
         result.append(item)
     return result
 
@@ -542,7 +673,7 @@ def get_kpi_counts(exam_id: Optional[str] = None) -> Dict:
         eid = exam_id.strip().upper()
         cursor.execute("SELECT COUNT(*) FROM rubrics WHERE exam_id=?", (eid,))
         questions = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(DISTINCT student_id) FROM submissions WHERE exam_id=?", (eid,))
+        cursor.execute("SELECT COUNT(DISTINCT student_id) FROM booklets WHERE exam_id=?", (eid,))
         booklets = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM submissions WHERE exam_id=?", (eid,))
         answers = cursor.fetchone()[0]
@@ -557,6 +688,437 @@ def get_kpi_counts(exam_id: Optional[str] = None) -> Dict:
         "answers": answers,
         "verified": verified,
     }
+
+
+def assign_segment_to_question(
+    exam_id: str,
+    student_id: str,
+    question_id: str,
+    start_char: Optional[int] = None,
+    end_char: Optional[int] = None,
+    custom_text: Optional[str] = None,
+    remove_from_unassigned: bool = True,
+) -> Dict[str, Any]:
+    """
+    Assign a text range (or custom edited text) to a specific question rubric:
+      - Explicitly supports start_char == 0 (e.g. when student skips Q1 and starts on Q2A).
+      - Immediately evaluates answer against target rubric using EduEval.
+      - Upserts into submissions and recalculates the SDMCET IA Choice Rule total.
+    """
+    eid = exam_id.strip().upper()
+    sid = student_id.strip().upper()
+    qid = question_id.strip().upper()
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM booklets WHERE exam_id=? AND student_id=?", (eid, sid))
+    booklet_row = cursor.fetchone()
+    full_text = booklet_row["full_transcribed_text"] if booklet_row else ""
+    image_paths_raw = booklet_row["image_paths"] if booklet_row else "[]"
+
+    if custom_text is not None and custom_text.strip():
+        ans_text = custom_text.strip()
+    elif start_char is not None:
+        s_idx = max(0, int(start_char))
+        e_idx = len(full_text) if end_char is None else min(len(full_text), int(end_char))
+        ans_text = full_text[s_idx:e_idx].strip()
+    else:
+        ans_text = full_text.strip()
+
+    if not ans_text:
+        conn.close()
+        raise ValueError("Cannot assign an empty text segment.")
+
+    cursor.execute("SELECT * FROM rubrics WHERE exam_id=? AND question_id=?", (eid, qid))
+    rub = cursor.fetchone()
+    if not rub:
+        conn.close()
+        raise ValueError(f"Rubric for question '{qid}' not found for exam '{eid}'")
+
+    from scorer import evaluate_with_edueval
+    from chunker import calculate_ia_total
+
+    past_examples = get_verified_examples(eid, qid, limit=2)
+    eval_res = evaluate_with_edueval(
+        question_text=rub["question_text"],
+        max_marks=float(rub["max_marks"]),
+        key_points=json.loads(rub["key_points"]),
+        student_answer=ans_text,
+        verified_examples=past_examples,
+    )
+
+    cursor.execute(
+        """
+        INSERT INTO submissions (
+            exam_id, student_id, question_id, image_paths, transcribed_text,
+            matched_points, missing_points, ai_score, ai_feedback, teacher_score,
+            teacher_verified, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Evaluated')
+        ON CONFLICT(exam_id, student_id, question_id) DO UPDATE SET
+            image_paths = excluded.image_paths,
+            transcribed_text = excluded.transcribed_text,
+            matched_points = excluded.matched_points,
+            missing_points = excluded.missing_points,
+            ai_score = excluded.ai_score,
+            ai_feedback = excluded.ai_feedback,
+            teacher_score = excluded.teacher_score,
+            teacher_verified = 0,
+            status = 'Evaluated'
+        """,
+        (
+            eid,
+            sid,
+            qid,
+            image_paths_raw,
+            ans_text,
+            json.dumps(eval_res["matched_points"]),
+            json.dumps(eval_res["missing_points"]),
+            eval_res["ai_score"],
+            eval_res["ai_feedback"],
+            eval_res["ai_score"],
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    updated_subs = get_exam_submissions(eid, sid)
+    scores = {r["question_id"]: float(r["teacher_score"] or r["ai_score"] or 0.0) for r in updated_subs}
+    ia_breakdown = calculate_ia_total(scores)
+
+    raw_booklet = get_raw_booklet(eid, sid)
+    return {
+        "status": "success",
+        "booklet": raw_booklet,
+        "submissions": updated_subs,
+        "ia_total": ia_breakdown["ia_total"],
+        "ia_breakdown": ia_breakdown,
+    }
+
+
+def split_at_cursor(
+    exam_id: str,
+    student_id: str,
+    source_question_id: str,
+    cursor_index: int,
+    target_question_id: str,
+) -> Dict[str, Any]:
+    """
+    Split an existing assigned answer at cursor_index:
+      - If cursor_index == 0: reassigns the entire text block from source_question_id
+        to target_question_id, deletes source_question_id, and grades target_question_id.
+      - If cursor_index > 0: keeps text[:cursor_index] in source_question_id, moves
+        text[cursor_index:] to target_question_id, and evaluates both with evaluate_with_edueval().
+    """
+    eid = exam_id.strip().upper()
+    sid = student_id.strip().upper()
+    source_qid = source_question_id.strip().upper()
+    target_qid = target_question_id.strip().upper()
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT * FROM submissions WHERE exam_id=? AND student_id=? AND question_id=?",
+        (eid, sid, source_qid),
+    )
+    sub = cursor.fetchone()
+    if not sub:
+        conn.close()
+        raise ValueError(f"Submission '{source_qid}' not found for student '{sid}'")
+
+    full_text = sub["transcribed_text"] or ""
+    image_paths_raw = sub["image_paths"] or "[]"
+
+    cursor.execute("SELECT * FROM rubrics WHERE exam_id=? AND question_id=?", (eid, target_qid))
+    target_rub = cursor.fetchone()
+    if not target_rub:
+        conn.close()
+        raise ValueError(f"Rubric for target question '{target_qid}' not found")
+
+    from scorer import evaluate_with_edueval
+    from chunker import calculate_ia_total
+
+    if int(cursor_index) == 0:
+        eval_target = evaluate_with_edueval(
+            question_text=target_rub["question_text"],
+            max_marks=float(target_rub["max_marks"]),
+            key_points=json.loads(target_rub["key_points"]),
+            student_answer=full_text,
+            verified_examples=get_verified_examples(eid, target_qid, limit=2),
+        )
+
+        try:
+            cursor.execute("BEGIN TRANSACTION")
+            cursor.execute(
+                "DELETE FROM submissions WHERE exam_id=? AND student_id=? AND question_id=?",
+                (eid, sid, source_qid),
+            )
+            cursor.execute(
+                """
+                INSERT INTO submissions (
+                    exam_id, student_id, question_id, image_paths, transcribed_text,
+                    matched_points, missing_points, ai_score, ai_feedback, teacher_score,
+                    teacher_verified, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Evaluated')
+                ON CONFLICT(exam_id, student_id, question_id) DO UPDATE SET
+                    image_paths = excluded.image_paths,
+                    transcribed_text = excluded.transcribed_text,
+                    matched_points = excluded.matched_points,
+                    missing_points = excluded.missing_points,
+                    ai_score = excluded.ai_score,
+                    ai_feedback = excluded.ai_feedback,
+                    teacher_score = excluded.teacher_score,
+                    teacher_verified = 0,
+                    status = 'Evaluated'
+                """,
+                (
+                    eid, sid, target_qid, image_paths_raw, full_text,
+                    json.dumps(eval_target["matched_points"]),
+                    json.dumps(eval_target["missing_points"]),
+                    eval_target["ai_score"],
+                    eval_target["ai_feedback"],
+                    eval_target["ai_score"],
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
+    else:
+        c_idx = max(0, min(len(full_text), int(cursor_index)))
+        text1 = full_text[:c_idx].strip()
+        text2 = full_text[c_idx:].strip()
+
+        cursor.execute("SELECT * FROM rubrics WHERE exam_id=? AND question_id=?", (eid, source_qid))
+        source_rub = cursor.fetchone()
+        if not source_rub:
+            conn.close()
+            raise ValueError(f"Rubric for source question '{source_qid}' not found")
+
+        eval1 = evaluate_with_edueval(
+            question_text=source_rub["question_text"],
+            max_marks=float(source_rub["max_marks"]),
+            key_points=json.loads(source_rub["key_points"]),
+            student_answer=text1,
+            verified_examples=get_verified_examples(eid, source_qid, limit=2),
+        )
+        eval2 = evaluate_with_edueval(
+            question_text=target_rub["question_text"],
+            max_marks=float(target_rub["max_marks"]),
+            key_points=json.loads(target_rub["key_points"]),
+            student_answer=text2,
+            verified_examples=get_verified_examples(eid, target_qid, limit=2),
+        )
+
+        try:
+            cursor.execute("BEGIN TRANSACTION")
+            cursor.execute(
+                """
+                UPDATE submissions
+                SET transcribed_text = ?,
+                    matched_points = ?,
+                    missing_points = ?,
+                    ai_score = ?,
+                    ai_feedback = ?,
+                    teacher_score = ?,
+                    teacher_verified = 0,
+                    status = 'Evaluated'
+                WHERE exam_id=? AND student_id=? AND question_id=?
+                """,
+                (
+                    text1,
+                    json.dumps(eval1["matched_points"]),
+                    json.dumps(eval1["missing_points"]),
+                    eval1["ai_score"],
+                    eval1["ai_feedback"],
+                    eval1["ai_score"],
+                    eid, sid, source_qid,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO submissions (
+                    exam_id, student_id, question_id, image_paths, transcribed_text,
+                    matched_points, missing_points, ai_score, ai_feedback, teacher_score,
+                    teacher_verified, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Evaluated')
+                ON CONFLICT(exam_id, student_id, question_id) DO UPDATE SET
+                    image_paths = excluded.image_paths,
+                    transcribed_text = excluded.transcribed_text,
+                    matched_points = excluded.matched_points,
+                    missing_points = excluded.missing_points,
+                    ai_score = excluded.ai_score,
+                    ai_feedback = excluded.ai_feedback,
+                    teacher_score = excluded.teacher_score,
+                    teacher_verified = 0,
+                    status = 'Evaluated'
+                """,
+                (
+                    eid, sid, target_qid, image_paths_raw, text2,
+                    json.dumps(eval2["matched_points"]),
+                    json.dumps(eval2["missing_points"]),
+                    eval2["ai_score"],
+                    eval2["ai_feedback"],
+                    eval2["ai_score"],
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
+
+    conn.close()
+
+    updated_subs = get_exam_submissions(eid, sid)
+    scores = {r["question_id"]: float(r["teacher_score"] or r["ai_score"] or 0.0) for r in updated_subs}
+    ia_breakdown = calculate_ia_total(scores)
+
+    return {
+        "status": "success",
+        "submissions": updated_subs,
+        "ia_total": ia_breakdown["ia_total"],
+        "ia_breakdown": ia_breakdown,
+    }
+
+
+def merge_and_reassign_submissions(
+    exam_id: str,
+    student_id: str,
+    source_question_ids: List[str],
+    target_question_id: str,
+) -> Dict[str, Any]:
+    """
+    Merge multiple fragmented submission chunks into a unified target question submission:
+      1. Fetch source submissions ordered by submission_id to preserve page order.
+      2. Concatenate transcribed_text with \\n\\n.
+      3. Union image paths.
+      4. In a single SQLite transaction, delete all source rows and insert/replace the unified target row.
+      5. Re-evaluate against target rubric using EduEval.
+      6. Return updated student submissions and recalculated SDMCET IA total.
+    """
+    eid = exam_id.strip().upper()
+    sid = student_id.strip().upper()
+    target_qid = target_question_id.strip().upper()
+    source_qids = [q.strip().upper() for q in source_question_ids if q.strip()]
+
+    if not source_qids:
+        raise ValueError("At least one source question ID is required for merge.")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    placeholders = ",".join(["?"] * len(source_qids))
+    cursor.execute(
+        f"SELECT * FROM submissions WHERE exam_id=? AND student_id=? AND question_id IN ({placeholders}) ORDER BY submission_id ASC",
+        [eid, sid] + source_qids,
+    )
+    rows = cursor.fetchall()
+
+    if not rows:
+        conn.close()
+        raise ValueError(f"No submissions found for sources {source_qids} (student: {sid}, exam: {eid})")
+
+    text_parts = [r["transcribed_text"].strip() for r in rows if r["transcribed_text"] and r["transcribed_text"].strip()]
+    unified_text = "\n\n".join(text_parts)
+
+    combined_images = []
+    for r in rows:
+        imgs = json.loads(r["image_paths"]) if r["image_paths"] else []
+        for img in imgs:
+            if img not in combined_images:
+                combined_images.append(img)
+
+    cursor.execute("SELECT * FROM rubrics WHERE exam_id=? AND question_id=?", (eid, target_qid))
+    target_rubric = cursor.fetchone()
+    if not target_rubric:
+        conn.close()
+        raise ValueError(f"Target question rubric '{target_qid}' not found for exam '{eid}'")
+
+    target_key_points = json.loads(target_rubric["key_points"])
+    target_max_marks = float(target_rubric["max_marks"])
+    target_q_text = target_rubric["question_text"]
+
+    from scorer import evaluate_with_edueval
+    from chunker import calculate_ia_total
+
+    past_examples = get_verified_examples(eid, target_qid, limit=2)
+    eval_res = evaluate_with_edueval(
+        question_text=target_q_text,
+        max_marks=target_max_marks,
+        key_points=target_key_points,
+        student_answer=unified_text,
+        verified_examples=past_examples,
+    )
+
+    try:
+        cursor.execute("BEGIN TRANSACTION")
+        cursor.execute(
+            f"DELETE FROM submissions WHERE exam_id=? AND student_id=? AND question_id IN ({placeholders})",
+            [eid, sid] + source_qids,
+        )
+        if target_qid not in source_qids:
+            cursor.execute(
+                "DELETE FROM submissions WHERE exam_id=? AND student_id=? AND question_id=?",
+                (eid, sid, target_qid),
+            )
+        cursor.execute(
+            """
+            INSERT INTO submissions (
+                exam_id, student_id, question_id, image_paths, transcribed_text,
+                matched_points, missing_points, ai_score, ai_feedback, teacher_score,
+                teacher_verified, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Evaluated')
+            """,
+            (
+                eid,
+                sid,
+                target_qid,
+                json.dumps(combined_images),
+                unified_text,
+                json.dumps(eval_res["matched_points"]),
+                json.dumps(eval_res["missing_points"]),
+                eval_res["ai_score"],
+                eval_res["ai_feedback"],
+                eval_res["ai_score"],
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+
+    conn.close()
+
+    updated_subs = get_exam_submissions(eid, sid)
+    scores = {r["question_id"]: float(r["teacher_score"] or r["ai_score"] or 0.0) for r in updated_subs}
+    ia_breakdown = calculate_ia_total(scores)
+
+    return {
+        "status": "success",
+        "submissions": updated_subs,
+        "ia_breakdown": ia_breakdown,
+    }
+
+
+def split_submission(
+    exam_id: str,
+    student_id: str,
+    source_question_id: str,
+    split_index: int,
+    new_question_id: str,
+) -> Dict[str, Any]:
+    """Delegates to split_at_cursor."""
+    return split_at_cursor(
+        exam_id=exam_id,
+        student_id=student_id,
+        source_question_id=source_question_id,
+        cursor_index=split_index,
+        target_question_id=new_question_id,
+    )
 
 
 if __name__ == "__main__":

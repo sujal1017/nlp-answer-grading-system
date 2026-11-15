@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from "react";
 import {
   CheckCircle2,
   Clock,
-  ExternalLink,
   ChevronLeft,
   ChevronRight,
   ZoomIn,
@@ -12,12 +11,37 @@ import {
   Check,
   AlertCircle,
   FileCheck,
+  Scissors,
+  RefreshCw,
+  Trash2,
+  Zap,
+  Search,
+  CornerDownRight,
 } from "lucide-react";
-import { getIaTotal, getSubmissions, verifyAnswer } from "../services/api";
+import {
+  getBooklet,
+  getSubmissions,
+  verifyAnswer,
+  splitSubmission,
+  evaluateStudent,
+  deleteSubmission,
+} from "../services/api";
+
+const ALL_QUESTION_IDS = ["Q1A", "Q1B", "Q2A", "Q2B", "Q3A", "Q3B"];
+
+function defaultTargetFor(qid) {
+  if (qid === "Q1A") return "Q2A";
+  if (qid === "Q2A") return "Q2B";
+  if (qid === "Q2B") return "Q3A";
+  if (qid === "Q3A") return "Q3B";
+  if (qid === "Q1B") return "Q2A";
+  return "Q1A";
+}
 
 export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
   const [students, setStudents] = useState([]);
   const [selected, setSelected] = useState("");
+  const [booklet, setBooklet] = useState(null);
   const [rows, setRows] = useState([]);
   const [ia, setIa] = useState(null);
   const [drafts, setDrafts] = useState({});
@@ -25,30 +49,63 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
   const [zoomLevel, setZoomLevel] = useState(100);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
-  const [savingQid, setSavingQid] = useState(null);
+
+  // Per-card interactive states
+  const [cardTexts, setCardTexts] = useState({});
+  const [cursorPositions, setCursorPositions] = useState({});
+  const [splitTargets, setSplitTargets] = useState({});
+
+  // Loading states
+  const [isEvaluatingAll, setIsEvaluatingAll] = useState(false);
+  const [evaluatingCard, setEvaluatingCard] = useState({});
+  const [splittingCard, setSplittingCard] = useState({});
+  const [deletingCard, setDeletingCard] = useState({});
+  const [savingCard, setSavingCard] = useState({});
 
   const load = async (studentId) => {
     if (!examId) return;
     try {
-      const { data } = await getSubmissions(examId, studentId || undefined);
-      setStudents(data.students || []);
-      const pick = studentId || data.students?.[0] || "";
+      const { data: subData } = await getSubmissions(examId, studentId || undefined);
+      const studentList = subData.students || [];
+      setStudents(studentList);
+      const pick = studentId || studentList[0] || "";
       setSelected(pick);
-      const filtered = pick ? data.submissions.filter((s) => s.student_id === pick) : data.submissions;
-      setRows(filtered);
-
-      const next = {};
-      filtered.forEach((s) => {
-        next[s.question_id] = {
-          teacher_score: s.teacher_score ?? s.ai_score ?? 0,
-          feedback: s.ai_feedback || "",
-        };
-      });
-      setDrafts(next);
 
       if (pick) {
-        const iaRes = await getIaTotal(examId, pick);
-        setIa(iaRes.data);
+        try {
+          const { data: bData } = await getBooklet(examId, pick);
+          setBooklet(bData.booklet || null);
+          const subs = bData.submissions || [];
+          setRows(subs);
+          if (bData.ia_breakdown) {
+            setIa(bData.ia_breakdown);
+          }
+          const nextDrafts = {};
+          const nextTexts = {};
+          subs.forEach((s) => {
+            nextDrafts[s.question_id] = {
+              teacher_score: s.teacher_score ?? s.ai_score ?? 0,
+              feedback: s.ai_feedback || "",
+            };
+            nextTexts[s.question_id] = s.transcribed_text || "";
+          });
+          setDrafts(nextDrafts);
+          setCardTexts(nextTexts);
+        } catch {
+          const filtered = (subData.submissions || []).filter((s) => s.student_id === pick);
+          setRows(filtered);
+          const nextDrafts = {};
+          const nextTexts = {};
+          filtered.forEach((s) => {
+            nextDrafts[s.question_id] = {
+              teacher_score: s.teacher_score ?? s.ai_score ?? 0,
+              feedback: s.ai_feedback || "",
+            };
+            nextTexts[s.question_id] = s.transcribed_text || "";
+          });
+          setDrafts(nextDrafts);
+          setCardTexts(nextTexts);
+        }
       }
     } catch (e) {
       setError(e.response?.data?.detail || e.message);
@@ -61,16 +118,167 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
   }, [examId, refreshKey]);
 
   const images = useMemo(() => {
+    if (booklet?.image_urls && booklet.image_urls.length > 0) {
+      return booklet.image_urls;
+    }
     const urls = rows[0]?.image_urls || [];
     return urls;
-  }, [rows]);
+  }, [booklet, rows]);
 
+  const handleCursorChange = (qid, pos) => {
+    setCursorPositions((prev) => ({ ...prev, [qid]: pos }));
+  };
+
+  // Step 2: Teacher Cursor Split or Reassign
+  const handleSplitCard = async (qid) => {
+    const pos = cursorPositions[qid] ?? 0;
+    const targetQid = splitTargets[qid] || defaultTargetFor(qid);
+    const textToSplit = cardTexts[qid] ?? "";
+
+    if (pos < 0) return;
+    setError("");
+    setMessage("");
+    setSplittingCard((prev) => ({ ...prev, [qid]: true }));
+
+    try {
+      const { data } = await splitSubmission({
+        exam_id: examId,
+        student_id: selected,
+        source_question_id: qid,
+        target_question_id: targetQid,
+        split_index: pos,
+        current_text: textToSplit,
+      });
+
+      setRows(data.submissions || []);
+      if (data.ia_breakdown) {
+        setIa(data.ia_breakdown);
+      }
+
+      const nextDrafts = { ...drafts };
+      const nextTexts = { ...cardTexts };
+      (data.submissions || []).forEach((s) => {
+        nextDrafts[s.question_id] = {
+          teacher_score: s.teacher_score ?? s.ai_score ?? 0,
+          feedback: s.ai_feedback || "",
+        };
+        nextTexts[s.question_id] = s.transcribed_text || "";
+      });
+      setDrafts(nextDrafts);
+      setCardTexts(nextTexts);
+
+      if (pos === 0) {
+        setMessage(
+          `Reassigned entire text of Question ${qid} to Question ${targetQid}! Empty ${qid} card removed.`
+        );
+      } else {
+        setMessage(
+          `Split Question ${qid} at character ${pos}! Second half moved to Question ${targetQid}.`
+        );
+      }
+      onCalibrated?.();
+    } catch (e) {
+      setError(e.response?.data?.detail || e.message);
+    } finally {
+      setSplittingCard((prev) => ({ ...prev, [qid]: false }));
+    }
+  };
+
+  // Step 3: Evaluate All Assigned Questions Against Rubrics
+  const handleEvaluateAll = async () => {
+    if (!selected) return;
+    setError("");
+    setMessage("");
+    setIsEvaluatingAll(true);
+    try {
+      const { data } = await evaluateStudent({
+        exam_id: examId,
+        student_id: selected,
+        question_id: null,
+      });
+      setRows(data.submissions || []);
+      if (data.ia_breakdown) {
+        setIa(data.ia_breakdown);
+      }
+      const nextDrafts = { ...drafts };
+      (data.submissions || []).forEach((s) => {
+        nextDrafts[s.question_id] = {
+          teacher_score: s.teacher_score ?? s.ai_score ?? 0,
+          feedback: s.ai_feedback || "",
+        };
+      });
+      setDrafts(nextDrafts);
+      setMessage(
+        `⚡ Successfully evaluated all ${data.submissions.length} question answers against active rubrics!`
+      );
+      onCalibrated?.();
+    } catch (e) {
+      setError(e.response?.data?.detail || e.message);
+    } finally {
+      setIsEvaluatingAll(false);
+    }
+  };
+
+  // Evaluate single question card on demand
+  const handleEvaluateSingleCard = async (qid) => {
+    setError("");
+    setMessage("");
+    setEvaluatingCard((prev) => ({ ...prev, [qid]: true }));
+    try {
+      const { data } = await evaluateStudent({
+        exam_id: examId,
+        student_id: selected,
+        question_id: qid,
+      });
+      setRows(data.submissions || []);
+      if (data.ia_breakdown) {
+        setIa(data.ia_breakdown);
+      }
+      const nextDrafts = { ...drafts };
+      (data.submissions || []).forEach((s) => {
+        nextDrafts[s.question_id] = {
+          teacher_score: s.teacher_score ?? s.ai_score ?? 0,
+          feedback: s.ai_feedback || "",
+        };
+      });
+      setDrafts(nextDrafts);
+      setMessage(`Evaluated Question ${qid} against its rubric criteria!`);
+      onCalibrated?.();
+    } catch (e) {
+      setError(e.response?.data?.detail || e.message);
+    } finally {
+      setEvaluatingCard((prev) => ({ ...prev, [qid]: false }));
+    }
+  };
+
+  // Delete card cleanly
+  const handleDeleteCard = async (qid) => {
+    if (!window.confirm(`Delete question card ${qid}?`)) return;
+    setError("");
+    setMessage("");
+    setDeletingCard((prev) => ({ ...prev, [qid]: true }));
+    try {
+      const { data } = await deleteSubmission(examId, selected, qid);
+      setRows(data.submissions || []);
+      if (data.ia_breakdown) {
+        setIa(data.ia_breakdown);
+      }
+      setMessage(`Deleted Question ${qid} card. SDMCET IA total updated.`);
+      onCalibrated?.();
+    } catch (e) {
+      setError(e.response?.data?.detail || e.message);
+    } finally {
+      setDeletingCard((prev) => ({ ...prev, [qid]: false }));
+    }
+  };
+
+  // Teacher verify / approve score & calibrate rubric weights
   const approve = async (qid) => {
     setError("");
     setMessage("");
-    setSavingQid(qid);
+    setSavingCard((prev) => ({ ...prev, [qid]: true }));
     try {
-      const { data } = await verifyAnswer({
+      await verifyAnswer({
         exam_id: examId,
         student_id: selected,
         question_id: qid,
@@ -85,7 +293,7 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
     } catch (e) {
       setError(e.response?.data?.detail || e.message);
     } finally {
-      setSavingQid(null);
+      setSavingCard((prev) => ({ ...prev, [qid]: false }));
     }
   };
 
@@ -100,7 +308,7 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
   if (!students.length) {
     return (
       <div className="surface-card text-center py-12 text-slate-500 text-sm">
-        No evaluated booklets found for this exam. Grade a student booklet in <b>02. Batch Grading</b> to view side-by-side verification.
+        No evaluated booklets found for this exam. Upload or grade a student booklet in <b>02. Batch Grading</b> to view interactive mapping.
       </div>
     );
   }
@@ -130,7 +338,7 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
             </select>
           </div>
           <p className="text-xs text-slate-500 mt-2">
-            Showing {rows.length} extracted answers across {images.length} handwritten booklet pages.
+            Showing {rows.length} question cards across {images.length} handwritten pages.
           </p>
         </div>
 
@@ -179,7 +387,7 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
         </div>
       )}
 
-      {/* Main Verification Grid */}
+      {/* Main Two-Column Layout */}
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
         {/* LEFT COLUMN: Handwritten Booklet Viewer */}
         <aside className="xl:col-span-5 surface-card space-y-3">
@@ -258,7 +466,7 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
               </div>
 
               {/* Main Image View */}
-              <div className="overflow-auto max-h-[640px] border border-slate-200 rounded-xl bg-slate-100 p-2 flex justify-center">
+              <div className="overflow-auto max-h-[700px] border border-slate-200 rounded-xl bg-slate-100 p-2 flex justify-center">
                 <img
                   src={images[activePageIdx]}
                   alt={`Student Answer Page ${activePageIdx + 1}`}
@@ -268,31 +476,72 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
               </div>
             </div>
           ) : (
-            <p className="text-sm text-slate-500 py-8 text-center">No images found for this submission.</p>
+            <p className="text-sm text-slate-500 py-8 text-center">No booklet images found.</p>
           )}
         </aside>
 
-        {/* RIGHT COLUMN: AI Grading & Teacher Override */}
+        {/* RIGHT COLUMN: Question Cards & On-Demand Rubric Evaluator */}
         <div className="xl:col-span-7 space-y-4">
-          <div className="flex items-center justify-between">
+          {/* Step 3: Global Evaluate All Assigned Questions Button */}
+          <div className="surface-card p-4 bg-gradient-to-r from-indigo-900 to-slate-900 text-white rounded-xl shadow-md flex flex-wrap items-center justify-between gap-3 border border-indigo-700">
+            <div>
+              <div className="flex items-center gap-2">
+                <Zap className="w-4 h-4 text-amber-400" />
+                <h4 className="font-bold text-sm text-white">
+                  Step 3: Automated Rubric Evaluation
+                </h4>
+              </div>
+              <p className="text-xs text-slate-300 mt-0.5">
+                Evaluates all assigned question cards against atomic rubrics using EduEval (MiniLM-L6 + Fuzzy Keyword).
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={isEvaluatingAll || rows.length === 0}
+              onClick={handleEvaluateAll}
+              className="bg-amber-400 hover:bg-amber-500 text-slate-950 font-extrabold text-xs px-4 py-2.5 rounded-lg inline-flex items-center gap-2 shadow transition-all disabled:opacity-50"
+            >
+              {isEvaluatingAll ? (
+                <>
+                  <RefreshCw className="w-4 h-4 animate-spin text-slate-950" />
+                  Evaluating All Cards...
+                </>
+              ) : (
+                <>
+                  <Zap className="w-4 h-4 text-slate-950 fill-slate-950" />
+                  ⚡ Evaluate All Answers Against Rubrics
+                </>
+              )}
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between pt-1">
             <h4 className="font-bold text-slate-900 text-sm">
-              Extracted Question Answers &amp; Continuous Calibration
+              Question Cards ({rows.length}) &amp; Cursor Splitter
             </h4>
             <span className="text-xs text-slate-500">
-              Teacher adjustments calibrate weights online
+              Click textarea to place split cursor (Char 0 reassigns card)
             </span>
           </div>
 
+          {/* Question Cards List */}
           {rows.map((sub) => {
             const isVerified = Boolean(sub.teacher_verified);
-            const isSaving = savingQid === sub.question_id;
+            const isSplitting = splittingCard[sub.question_id];
+            const isEvaluating = evaluatingCard[sub.question_id];
+            const isDeleting = deletingCard[sub.question_id];
+            const isSaving = savingCard[sub.question_id];
+
+            const pos = cursorPositions[sub.question_id] ?? 0;
+            const targetQid = splitTargets[sub.question_id] || defaultTargetFor(sub.question_id);
+            const textLength = cardTexts[sub.question_id]?.length || 0;
 
             return (
-              <article key={sub.question_id} className="surface-card space-y-3">
+              <article key={sub.question_id} className="surface-card space-y-3 border border-slate-200">
                 {/* Header row */}
                 <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-100">
                   <div className="flex items-center gap-2">
-                    <span className="font-bold text-base text-slate-900 tracking-tight">
+                    <span className="font-extrabold text-base text-slate-900 tracking-tight">
                       Question {sub.question_id}
                     </span>
                     <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-slate-100 text-slate-700">
@@ -300,11 +549,28 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
                     </span>
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {/* On-demand single card evaluation button */}
+                    <button
+                      type="button"
+                      disabled={isEvaluating}
+                      onClick={() => handleEvaluateSingleCard(sub.question_id)}
+                      className="text-xs font-semibold px-2.5 py-1 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 inline-flex items-center gap-1 transition-colors"
+                      title={`Re-evaluate Question ${sub.question_id}`}
+                    >
+                      {isEvaluating ? (
+                        <RefreshCw className="w-3 h-3 animate-spin" />
+                      ) : (
+                        <Search className="w-3 h-3" />
+                      )}
+                      <span>Evaluate This Question</span>
+                    </button>
+
                     <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200 inline-flex items-center gap-1">
                       <Sparkles className="w-3 h-3 text-indigo-600" />
                       AI Score: <b>{sub.ai_score ?? 0}</b> / 5
                     </span>
+
                     <span
                       className={`text-xs font-semibold px-2.5 py-1 rounded-full inline-flex items-center gap-1 ${
                         isVerified
@@ -322,17 +588,94 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
                         </>
                       )}
                     </span>
+
+                    {/* Delete card */}
+                    <button
+                      type="button"
+                      disabled={isDeleting}
+                      onClick={() => handleDeleteCard(sub.question_id)}
+                      className="p-1 rounded hover:bg-red-50 text-slate-400 hover:text-red-600 transition-colors"
+                      title={`Delete Question ${sub.question_id}`}
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
                   </div>
                 </div>
 
-                {/* Transcribed Answer Box */}
+                {/* Editable Textarea */}
                 <div>
-                  <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 block mb-1">
-                    Digitized Handwritten Content (Qwen2-VL)
-                  </label>
-                  <pre className="text-xs leading-relaxed font-mono whitespace-pre-wrap bg-slate-50 border border-slate-200 rounded-lg p-3 max-h-44 overflow-y-auto text-slate-800">
-                    {sub.transcribed_text}
-                  </pre>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                      Transcribed Text ({textLength} characters)
+                    </label>
+                    <span className="text-[11px] text-slate-400 font-mono">
+                      Click anywhere to place split cursor
+                    </span>
+                  </div>
+                  <textarea
+                    rows={8}
+                    value={cardTexts[sub.question_id] ?? ""}
+                    onChange={(e) =>
+                      setCardTexts((prev) => ({ ...prev, [sub.question_id]: e.target.value }))
+                    }
+                    onSelect={(e) => handleCursorChange(sub.question_id, e.target.selectionStart)}
+                    onClick={(e) => handleCursorChange(sub.question_id, e.target.selectionStart)}
+                    onKeyUp={(e) => handleCursorChange(sub.question_id, e.target.selectionStart)}
+                    placeholder="Transcribed student text..."
+                    className="w-full text-xs font-mono leading-relaxed p-3 rounded-lg border border-slate-300 bg-slate-50/50 text-slate-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  />
+                </div>
+
+                {/* Cursor Split Toolbar */}
+                <div className="p-3 bg-slate-100 rounded-xl border border-slate-200 flex flex-wrap items-center justify-between gap-3 text-xs">
+                  <div className="flex items-center gap-2">
+                    <Scissors className="w-4 h-4 text-indigo-600 shrink-0" />
+                    <span className="font-mono text-slate-700">
+                      Cursor: <b>Char {pos}</b> / {textLength}
+                    </span>
+                    {pos === 0 && (
+                      <span className="text-[11px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full">
+                        Start of text (Reassigns card)
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-slate-600 font-medium">Target:</span>
+                    <select
+                      value={targetQid}
+                      onChange={(e) =>
+                        setSplitTargets((prev) => ({ ...prev, [sub.question_id]: e.target.value }))
+                      }
+                      className="bg-white border border-slate-300 text-xs font-bold rounded-lg px-2.5 py-1.5 text-slate-900"
+                    >
+                      {ALL_QUESTION_IDS.filter((q) => q !== sub.question_id).map((qid) => (
+                        <option key={qid} value={qid}>
+                          Question {qid}
+                        </option>
+                      ))}
+                    </select>
+
+                    <button
+                      type="button"
+                      disabled={isSplitting}
+                      onClick={() => handleSplitCard(sub.question_id)}
+                      className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs px-3 py-1.5 rounded-lg inline-flex items-center gap-1.5 shadow-sm transition-colors disabled:opacity-50"
+                    >
+                      {isSplitting ? (
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      ) : pos === 0 ? (
+                        <CornerDownRight className="w-3.5 h-3.5" />
+                      ) : (
+                        <Scissors className="w-3.5 h-3.5" />
+                      )}
+                      <span>
+                        {pos === 0
+                          ? `↪️ Reassign Entire Text to ${targetQid}`
+                          : `✂️ Split from Char ${pos} -> Assign to ${targetQid}`}
+                      </span>
+                    </button>
+                  </div>
                 </div>
 
                 {/* Matched vs Missing Rubric Points */}

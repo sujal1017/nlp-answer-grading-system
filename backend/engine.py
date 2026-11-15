@@ -2,7 +2,7 @@ import json
 import os
 import re
 import threading
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 # Enforce offline huggingface operation
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -188,16 +188,20 @@ PREFIX_RE = re.compile(
 
 
 def _strip_coordinates_and_noise(text: str) -> str:
-    """Strips bounding box coordinates, grounding tags, and hallucinated quiz blocks."""
+    """Strips bounding box coordinates, grounding tags, and synthetic quiz blocks without deleting student text."""
     if not text:
         return ""
-    # Coordinate pairs: r'\(\s*\d+\s*,\s*\d+\s*\)\s*(?:,\s*\(\s*\d+\s*,\s*\d+\s*\))?'
-    text = re.sub(r"\(\s*\d+\s*,\s*\d+\s*\)\s*(?:,\s*\(\s*\d+\s*,\s*\d+\s*\))?", "", text)
-    text = re.sub(r"\[\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\]", "", text)
-    # Grounding tags: r'<\|.*?\|>'
+    # Coordinate pairs: r'\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\)\s*(?:,\s*\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\))?'
+    text = re.sub(
+        r"\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\)\s*(?:,\s*\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\))?",
+        "",
+        text,
+    )
+    # Coordinate brackets: r'\[\s*\d{1,4}\s*,\s*\d{1,4}\s*,\s*\d{1,4}\s*,\s*\d{1,4}\s*\]'
+    text = re.sub(r"\[\s*\d{1,4}\s*,\s*\d{1,4}\s*,\s*\d{1,4}\s*,\s*\d{1,4}\s*\]", "", text)
+    # Grounding tags: r'<\|.*?\|>' and non-DOTALL reference/box tags
     text = re.sub(r"<\|.*?\|>", "", text)
-    text = re.sub(r"<ref>.*?</ref>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<box>.*?</box>", "", text, flags=re.DOTALL)
+    text = re.sub(r"</?(?:ref|box|quad)>", "", text)
     # Hallucinated quiz blocks: r'(?i)(?:^|\n)\s*(?:#+\s*)?Question\s+\d+\s*:\s*What\b.*'
     text = re.sub(r"(?i)(?:^|\n)\s*(?:#+\s*)?Question\s+\d+\s*:\s*What\b.*", "", text)
     return text.strip()
@@ -226,6 +230,108 @@ def sanitize_ocr_text(text: str) -> str:
     text = collapse_word_loops(text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
+
+
+def _preprocess_page_image(image_path: str) -> str:
+    """Enhance contrast and sharpness for faint handwritten blue ink and lined backgrounds."""
+    if not os.path.exists(image_path):
+        return image_path
+    try:
+        from PIL import Image, ImageEnhance, ImageOps
+        import tempfile
+        with Image.open(image_path) as img:
+            rgb_img = img.convert("RGB")
+            contrasted = ImageOps.autocontrast(rgb_img, cutoff=1)
+            contrasted = ImageEnhance.Contrast(contrasted).enhance(1.35)
+            sharpened = ImageEnhance.Sharpness(contrasted).enhance(1.5)
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp_path = tmp.name
+            tmp.close()
+            sharpened.save(tmp_path)
+            return tmp_path
+    except Exception as exc:
+        print(f"[!] Warning: image preprocessing failed for {image_path}: {exc}")
+        return image_path
+
+
+def _crop_horizontal_halves(image_path: str) -> Tuple[str, str]:
+    """Crops the image horizontally into two overlapping halves (0-55% and 45-100% height)."""
+    from PIL import Image
+    import tempfile
+    with Image.open(image_path) as img:
+        w, h = img.size
+        top_box = (0, 0, w, int(h * 0.55))
+        bottom_box = (0, int(h * 0.45), w, h)
+        top_half = img.crop(top_box)
+        bottom_half = img.crop(bottom_box)
+
+        t1 = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        p1 = t1.name
+        t1.close()
+        top_half.save(p1)
+
+        t2 = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        p2 = t2.name
+        t2.close()
+        bottom_half.save(p2)
+
+        return p1, p2
+
+
+def extract_left_margin_crop(image_path: str, margin_ratio: float = 0.18) -> Optional[str]:
+    """Crops the left margin_ratio (default 18%) of an image using Pillow and returns the temporary cropped image path."""
+    if not os.path.exists(image_path):
+        return None
+    try:
+        from PIL import Image
+        import tempfile
+        with Image.open(image_path) as img:
+            w, h = img.size
+            crop_w = max(10, int(w * margin_ratio))
+            margin_crop = img.crop((0, 0, crop_w, h))
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp_path = tmp.name
+            tmp.close()
+            margin_crop.save(tmp_path)
+            return tmp_path
+    except Exception as exc:
+        print(f"[!] Warning: margin crop failed: {exc}")
+        return None
+
+
+def extract_left_margin_marker(
+    image_path: str,
+    margin_ratio: float = 0.18,
+    engine: Optional["LocalGradingEngine"] = None,
+) -> Optional[str]:
+    """Crops the left 18% vertical margin using Pillow and extracts margin question markers."""
+    crop_path = extract_left_margin_crop(image_path, margin_ratio)
+    if not crop_path:
+        return None
+    try:
+        if engine is not None:
+            prompt = (
+                "Look at this left margin strip of an exam booklet. "
+                "Output ONLY the question number marker written here (e.g. 'Q1] a', '2] (b)', '3] a', '3b)'). "
+                "If no question marker is present, output None."
+            )
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": crop_path},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+            res = engine._generate_text(messages, max_tokens=32, temperature=0.0)
+            res = _strip_coordinates_and_noise(res).strip()
+            if res and res.lower() != "none" and len(res) <= 30:
+                return res
+        return None
+    finally:
+        if os.path.exists(crop_path):
+            os.remove(crop_path)
 
 
 class LocalGradingEngine:
@@ -319,11 +425,26 @@ class LocalGradingEngine:
                 return_tensors="pt",
             ).to(self.model.device)
 
+            # Grounding block via bad_words_ids
+            grounding_tokens = ["<|box_start|>", "<|box_end|>", "<|object_ref_start|>", "<|object_ref_end|>"]
+            bad_words_ids = []
+            if hasattr(self.processor, "tokenizer") and self.processor.tokenizer is not None:
+                for t in grounding_tokens:
+                    try:
+                        tid = self.processor.tokenizer.convert_tokens_to_ids(t)
+                        if tid is not None and tid != getattr(self.processor.tokenizer, "unk_token_id", None):
+                            bad_words_ids.append([tid])
+                    except Exception:
+                        pass
+
             # Ensure sampling parameters are passed ONLY when do_sample=True
             gen_kwargs = {
                 "max_new_tokens": max_tokens,
                 "repetition_penalty": repetition_penalty,
             }
+            if bad_words_ids:
+                gen_kwargs["bad_words_ids"] = bad_words_ids
+
             if temperature and temperature > 0.0:
                 gen_kwargs["do_sample"] = True
                 gen_kwargs["temperature"] = temperature
@@ -341,55 +462,116 @@ class LocalGradingEngine:
             )[0]
             return sanitize_ocr_text(output.strip())
 
-    def transcribe_images(self, image_paths: List[str], progress_cb=None) -> str:
-        """Digitize handwritten booklet pages verbatim (question papers are teacher-entered)."""
-        prompt_text = (
-            "Read this handwritten exam page and write down all the handwritten English text line by line.\n"
-            "- Keep margin question numbers like 'Q1] a]', 'b)', '2] (b)', '3] a', '3b)' and headings intact.\n"
-            "- Do NOT output coordinates or numbers in parentheses like (25,47),(998,950).\n"
-            "- Do NOT output Markdown tables or extra commentary."
+    def extract_left_margin_marker(self, image_path: str, margin_ratio: float = 0.18) -> Optional[str]:
+        return extract_left_margin_marker(image_path, margin_ratio=margin_ratio, engine=self)
+
+    def transcribe_images(
+        self,
+        image_paths: List[str],
+        progress_cb=None,
+        extract_margins: bool = False,
+        auto_unload: bool = True,
+    ) -> str:
+        """Digitize handwritten booklet pages verbatim with 3-stage fallback guarantee (no page skipped)."""
+        prompt_attempt1 = (
+            "Transcribe all handwritten text from this exam answer sheet page from top to bottom. "
+            "Include all headings, margin numbers (such as a), 2(b), 3a, 3b), bullet points, and definitions."
         )
+        prompt_split = "Read and transcribe every handwritten line visible in this image:"
         pages_md = []
         total = len(image_paths)
-        for idx, img_path in enumerate(image_paths):
-            if not os.path.exists(img_path):
-                continue
-            if progress_cb:
-                progress_cb(f"Digitizing page {idx + 1}/{total} (verbatim)")
-            print(f"[*] OCR Verbatim Processing Page {idx + 1}/{total}: {img_path}")
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": img_path},
-                        {"type": "text", "text": prompt_text},
-                    ],
-                }
-            ]
-            page_text = self._generate_text(
-                messages, max_tokens=1024, temperature=0.0, repetition_penalty=1.05
-            )
+        try:
+            for idx, img_path in enumerate(image_paths):
+                if not os.path.exists(img_path):
+                    continue
+                if progress_cb:
+                    progress_cb(f"Digitizing page {idx + 1}/{total} (verbatim)")
+                print(f"[*] OCR Verbatim Processing Page {idx + 1}/{total}: {img_path}")
 
-            # Fallback Retry: If page text after stripping coordinates is < 15 chars, retry once
-            clean_check = _strip_coordinates_and_noise(page_text)
-            if len(clean_check) < 15:
-                print(f"[*] Page {idx + 1} produced low text or coordinates only (<15 chars). Running fallback retry...")
-                retry_prompt = "Extract all handwritten words and sentences visible on this lined paper as plain text."
-                retry_messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": img_path},
-                            {"type": "text", "text": retry_prompt},
-                        ],
-                    }
-                ]
-                page_text = self._generate_text(
-                    retry_messages, max_tokens=1024, temperature=0.0, repetition_penalty=1.05
-                )
+                margin_marker = None
+                if extract_margins:
+                    margin_marker = self.extract_left_margin_marker(img_path)
 
-            pages_md.append(f"### Page {idx + 1}\n{page_text}")
-        return "\n\n---\n\n".join(pages_md)
+                # Preprocess image contrast & sharpness for faint blue ink
+                enhanced_path = _preprocess_page_image(img_path)
+                cleanup_files = []
+                if enhanced_path != img_path:
+                    cleanup_files.append(enhanced_path)
+
+                page_text = ""
+                words_count = 0
+                try:
+                    # Attempt 1: Full-page OCR with clean positive prompt
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "image": enhanced_path},
+                                {"type": "text", "text": prompt_attempt1},
+                            ],
+                        }
+                    ]
+                    page_text = self._generate_text(
+                        messages, max_tokens=1024, temperature=0.0, repetition_penalty=1.05
+                    )
+                    words_count = len(re.findall(r'[a-zA-Z]{3,}', page_text))
+
+                    # Attempt 2: Top/Bottom Split Pass if < 15 alphabetic words
+                    if words_count < 15:
+                        print(f"[*] Page {idx + 1} produced only {words_count} words (<15 words). Running Attempt 2 (Top/Bottom Split Pass)...")
+                        try:
+                            p_top, p_bot = _crop_horizontal_halves(enhanced_path)
+                            cleanup_files.extend([p_top, p_bot])
+                            top_text = self._generate_text(
+                                [{"role": "user", "content": [{"type": "image", "image": p_top}, {"type": "text", "text": prompt_split}]}],
+                                max_tokens=768, temperature=0.0, repetition_penalty=1.05
+                            )
+                            bot_text = self._generate_text(
+                                [{"role": "user", "content": [{"type": "image", "image": p_bot}, {"type": "text", "text": prompt_split}]}],
+                                max_tokens=768, temperature=0.0, repetition_penalty=1.05
+                            )
+                            candidate_text = f"{top_text}\n{bot_text}".strip()
+                            candidate_words = len(re.findall(r'[a-zA-Z]{3,}', candidate_text))
+                            if candidate_words > words_count:
+                                page_text = candidate_text
+                                words_count = candidate_words
+                        except Exception as split_exc:
+                            print(f"[!] Attempt 2 failed: {split_exc}")
+
+                    # Attempt 3: Mild Sampling Fallback if still < 15 alphabetic words
+                    if words_count < 15:
+                        print(f"[*] Page {idx + 1} produced only {words_count} words (<15 words). Running Attempt 3 (Mild Sampling Fallback)...")
+                        try:
+                            sample_text = self._generate_text(
+                                messages, max_tokens=1024, temperature=0.2, repetition_penalty=1.08
+                            )
+                            sample_words = len(re.findall(r'[a-zA-Z]{3,}', sample_text))
+                            if sample_words > words_count:
+                                page_text = sample_text
+                                words_count = sample_words
+                        except Exception as sample_exc:
+                            print(f"[!] Attempt 3 failed: {sample_exc}")
+
+                finally:
+                    # Clean up temporary preprocessed/cropped files
+                    for cf in cleanup_files:
+                        if os.path.exists(cf):
+                            try:
+                                os.remove(cf)
+                            except Exception:
+                                pass
+
+                # Log word count for every single page
+                print(f"[*] Page {idx + 1}: {words_count} words")
+
+                if margin_marker and margin_marker not in page_text:
+                    page_text = f"{margin_marker}\n{page_text}"
+
+                pages_md.append(f"--- Page {idx + 1} ---\n{page_text}")
+            return "\n\n".join(pages_md)
+        finally:
+            if auto_unload:
+                self.unload_model()
 
     def evaluate_answer(
         self,

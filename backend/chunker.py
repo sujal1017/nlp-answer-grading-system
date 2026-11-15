@@ -14,6 +14,18 @@ STOPWORDS = {
     "your", "using", "used", "than", "them", "they", "will", "were",
 }
 
+# Explicitly ignore Roman numerals from triggering question boundaries
+ROMAN_NUMERAL_RE = re.compile(
+    r"^(?:#+\s*)?[([]?\s*(?:i|ii|iii|iv|v|vi|vii|viii|ix|x)\s*[)\]:.-]",
+    re.IGNORECASE,
+)
+
+# Explicitly ignore indented internal lists (e.g. 2+ spaces or tab followed by 1., a), i))
+INDENTED_LIST_RE = re.compile(
+    r"^(?:[ \t]{2,}|\t)[([]?\s*(?:\d+|[a-zA-Z]|i{1,3}|iv|v|vi{1,3})\s*[)\]:.-]",
+    re.IGNORECASE,
+)
+
 
 def convert_pdf_to_images(pdf_bytes: bytes, output_dir: str) -> List[str]:
     """Converts an uploaded PDF file into individual PNG images per page."""
@@ -32,6 +44,7 @@ def convert_pdf_to_images(pdf_bytes: bytes, output_dir: str) -> List[str]:
 
 def clean_page_markers(markdown_text: str) -> str:
     cleaned = re.sub(r"###\s*Page\s*\d+\s*", "\n", markdown_text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"---+\s*Page\s*\d+\s*---+", "\n", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\n---+\n", "\n", cleaned)
     return cleaned.strip()
 
@@ -156,21 +169,56 @@ def keywords(text: str) -> Set[str]:
     return {w for w in re.findall(r"[a-z]{4,}", (text or "").lower()) if w not in STOPWORDS}
 
 
-def _match_orphan_subquestion(answer_text: str, sub_letter: str, rubrics: List[Dict], existing_keys: List[str]) -> str:
+def _match_orphan_subquestion(
+    answer_text: str,
+    sub_letter: str,
+    rubrics: List[Dict],
+    existing_keys: List[str],
+) -> str:
+    """
+    Semantic Topic Routing for orphan sub-questions (e.g. a) or b) written without main number):
+    1. Compares first 250 characters of answer_text against candidate rubric questions ending with sub_letter
+       using all-MiniLM-L6-v2 cosine similarity.
+    2. Falls back to RapidFuzz and keyword overlap if embedder is unavailable.
+    """
     candidates = [r for r in rubrics if str(r.get("question_id", "")).upper().endswith(sub_letter.upper())]
     if not candidates:
         return f"Q1{sub_letter.upper()}"
 
-    ans_words = keywords(answer_text[:400])
-    best_qid = str(candidates[0]["question_id"]).upper()
-    best_overlap = -1
+    probe_text = (answer_text or "").strip()[:250]
+    if not probe_text:
+        for c in candidates:
+            qid = str(c["question_id"]).upper()
+            if qid not in existing_keys:
+                return qid
+        return str(candidates[0]["question_id"]).upper()
 
+    # 1. Semantic Topic Routing using all-MiniLM-L6-v2
+    try:
+        from scorer import get_embedder
+        import numpy as np
+        embedder = get_embedder()
+        if embedder is not None:
+            cand_texts = [c.get("question_text", "") for c in candidates]
+            cand_embs = embedder.encode(cand_texts, convert_to_numpy=True, normalize_embeddings=True)
+            probe_emb = embedder.encode([probe_text], convert_to_numpy=True, normalize_embeddings=True)[0]
+            sims = np.dot(cand_embs, probe_emb)
+            best_idx = int(np.argmax(sims))
+            return str(candidates[best_idx]["question_id"]).upper()
+    except Exception:
+        pass
+
+    # 2. Fallback using RapidFuzz token_set_ratio + keyword overlap
+    best_qid = str(candidates[0]["question_id"]).upper()
+    best_score = -1.0
     for c in candidates:
-        q_words = keywords(c.get("question_text", ""))
-        overlap = len(ans_words.intersection(q_words))
+        q_text = c.get("question_text", "")
+        ratio = fuzz.token_set_ratio(probe_text.lower(), q_text.lower())
         qid = str(c["question_id"]).upper()
-        if overlap > best_overlap or (overlap == best_overlap and qid not in existing_keys):
-            best_overlap = overlap
+        bonus = 5.0 if qid not in existing_keys else 0.0
+        score = ratio + bonus
+        if score > best_score:
+            best_score = score
             best_qid = qid
     return best_qid
 
@@ -270,7 +318,11 @@ def _best_unlabeled_qid(block: str, rubrics: List[Dict], used: List[str]) -> Opt
     return None
 
 
-def chunk_student_booklet(raw_markdown: str, rubrics: Optional[List[Dict]] = None) -> Dict[str, str]:
+def chunk_student_booklet(
+    raw_markdown: str,
+    rubrics: Optional[List[Dict]] = None,
+    margin_anchors: Optional[List[str]] = None,
+) -> Dict[str, str]:
     """
     Hybrid boundary detection & multi-page continuation:
       1. Merge two-tier margin markers across lines (Q1]\\n a] -> Q1A) ).
@@ -278,8 +330,15 @@ def chunk_student_booklet(raw_markdown: str, rubrics: Optional[List[Dict]] = Non
       3. Track current_qid and transition standalone sub-letters (e.g. b] when current is Q1A -> Q1B).
       4. Treat standalone headings as semantic anchors against active teacher questions using RapidFuzz.
       5. Strictly validate all output keys to match ^Q[1-3][A-B]$ (never naked Q1 or Q2).
+      6. Exclude Roman numerals and indented lists from triggering false question splits.
+      7. Semantically route orphan sub-questions via all-MiniLM-L6-v2 embeddings.
     """
     rubrics = rubrics or []
+    if margin_anchors:
+        anchor_text = "\n".join(a for a in margin_anchors if a)
+        if anchor_text:
+            raw_markdown = f"{anchor_text}\n\n{raw_markdown}"
+
     text = clean_page_markers(raw_markdown)
     text = re.sub(r"^\s*\|?\s*Internal Assessment\s*[-–—]?\s*[I1V]+\s*\n?", "", text, flags=re.IGNORECASE)
     text = merge_two_tier_margins(text)
@@ -293,6 +352,10 @@ def chunk_student_booklet(raw_markdown: str, rubrics: Optional[List[Dict]] = Non
     for idx, raw_line in enumerate(lines):
         line = raw_line.strip()
         if not line:
+            continue
+
+        # Exclude Roman numerals & indented sub-lists from triggering boundaries
+        if ROMAN_NUMERAL_RE.match(line) or INDENTED_LIST_RE.match(raw_line):
             continue
 
         # Check if line is a generic continuation marker: "Contd...", "Continued", "(contd)"

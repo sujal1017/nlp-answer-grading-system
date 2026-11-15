@@ -6,15 +6,32 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from chunker import calculate_ia_total, chunk_student_booklet, normalize_margin_markers, parse_teacher_questions
-from engine import generate_atomic_rubric, sanitize_ocr_text, _strip_coordinates_and_noise, LocalGradingEngine
+from engine import (
+    generate_atomic_rubric,
+    sanitize_ocr_text,
+    _strip_coordinates_and_noise,
+    LocalGradingEngine,
+    extract_left_margin_marker,
+)
 from scorer import evaluate_with_edueval, clean_ocr_text
 from database import (
     init_db,
     get_connection,
     get_all_exams,
     get_exam_rubrics,
+    get_exam_submissions,
     get_kpi_counts,
     update_rubric_weights_from_feedback,
+    save_student_answer,
+    save_raw_booklet,
+    get_raw_booklet,
+    get_exam_booklets,
+    assign_segment_to_question,
+    split_at_cursor,
+    delete_student_submission,
+    delete_all_student_submissions,
+    merge_and_reassign_submissions,
+    split_submission,
     TRAINING_LOG,
 )
 
@@ -201,7 +218,6 @@ Q1] (6) Literature review summarizes past literature.
 
 def test_booklet_chunking_test_pdf_and_test1_pdf():
     """Test realistic chunking for test.pdf pattern (Q2A, Q2B, Q3A, Q3B) and test1.pdf (Q1A, Q1B, Q3A, Q3B)."""
-    # Pattern modeled from test.pdf (Student chooses Q2 and Q3)
     test_pdf_transcription = """### Page 1
 2] (a) Classify and explain the different types of research with examples:
 Descriptive research describes the state of affairs as it exists at present.
@@ -233,7 +249,6 @@ Hypothesis: Tentative assumption made to draw out and test logical consequences.
     for k in keys_test:
         assert k in {"Q1A", "Q1B", "Q2A", "Q2B", "Q3A", "Q3B"}, f"Illegal key in test.pdf: {k}"
 
-    # Pattern modeled from test1.pdf (Student chooses Q1 and Q3, two-tier margins)
     test1_pdf_transcription = """### Page 1
 Q1]
 a]
@@ -277,6 +292,244 @@ Key concepts:
     for k in keys_test1:
         assert k in {"Q1A", "Q1B", "Q2A", "Q2B", "Q3A", "Q3B"}, f"Illegal key in test1.pdf: {k}"
     print("  [ok] realistic booklet chunking on test.pdf & test1.pdf with zero naked Q1/Q2 keys")
+
+
+def test_roman_numerals_and_internal_lists_no_split():
+    """Verify that Roman numerals (i)-(x) and indented sub-lists inside an answer do NOT trigger chunk splits."""
+    booklet = """
+2] a) Types of research are classified as follows:
+(i) Fundamental research: Basic pure science and general theories.
+(ii) Applied research: Solving immediate practical problems facing society.
+(iii) Qualitative research: Exploring human behavior and qualities.
+(iv) Quantitative research: Numerical measurement and statistics.
+
+   1. Descriptive studies
+   2. Diagnostic studies
+These sub-points must remain strictly inside Q2A without fragmenting.
+"""
+    chunks = chunk_student_booklet(booklet, RUBRICS)
+    assert set(chunks.keys()) == {"Q2A"}, f"Expected only Q2A, got: {chunks.keys()}"
+    ans = chunks["Q2A"]
+    assert "(i) Fundamental" in ans
+    assert "(iv) Quantitative" in ans
+    assert "Descriptive studies" in ans
+    print("  [ok] Roman numerals (i)-(iv) and indented sub-lists do not split answer blocks")
+
+
+def test_orphan_subquestion_semantic_routing():
+    """Verify semantic routing: orphan a) matches highest cosine similarity against candidate questions."""
+    booklet_types = """
+a) The different types of research with examples include fundamental and applied research, descriptive and analytical methods.
+"""
+    chunks_q2a = chunk_student_booklet(booklet_types, RUBRICS)
+    assert "Q2A" in chunks_q2a, f"Expected Q2A for research types, got {chunks_q2a.keys()}"
+
+    booklet_prob = """
+a) Techniques used for defining a research problem include broad concept exploration, reviewing existing literature, and setting objectives.
+"""
+    chunks_q3a = chunk_student_booklet(booklet_prob, RUBRICS)
+    assert "Q3A" in chunks_q3a, f"Expected Q3A for problem definition, got {chunks_q3a.keys()}"
+    print("  [ok] Semantic topic routing accurately maps orphan a) to Q2A and Q3A via embeddings")
+
+
+def test_raw_booklet_persistence():
+    """Verify raw booklets persistence and retrieval."""
+    init_db()
+    eid = "IA1_RM_2026"
+    sid = "TEST_RAW_001"
+    raw_text = "--- Page 1 ---\nHandwritten page 1 text.\n\n--- Page 2 ---\nHandwritten page 2 text."
+    images = ["page_1.png", "page_2.png"]
+
+    save_raw_booklet(eid, sid, images, raw_text)
+    booklet = get_raw_booklet(eid, sid)
+    assert booklet is not None
+    assert booklet["student_id"] == sid
+    assert booklet["full_transcribed_text"] == raw_text
+    assert booklet["image_paths"] == images
+
+    booklets = get_exam_booklets(eid)
+    student_ids = [b["student_id"] for b in booklets]
+    assert sid in student_ids
+    print("  [ok] raw booklet persistence and retrieval")
+
+
+def test_assign_segment_with_index_0_and_all_questions():
+    """Verify assigning segment explicitly starting at index 0 (handling student skipping Q1)."""
+    init_db()
+    eid = "IA1_RM_2026"
+    sid = "TEST_STUDENT_INDEX0"
+    raw_text = (
+        "Classify and explain the different types of research with examples:\n"
+        "Fundamental research is pure theoretical exploration.\n"
+        "Applied research finds immediate practical solutions.\n\n"
+        "Essential features of a good research design:\n"
+        "Flexible, efficient, and economical.\n"
+        "Controls extraneous variables.\n\n"
+        "Techniques for defining a research problem:\n"
+        "Statement in a general way, literature survey, setting objectives.\n\n"
+        "Concepts associated with research design:\n"
+        "Independent and dependent variables, extraneous factors, hypotheses."
+    )
+    save_raw_booklet(eid, sid, ["page_1.png"], raw_text)
+
+    # 1. Assign Q2A starting at character index 0 (essential test for non-falsy start_char == 0)
+    split_q2b = raw_text.find("Essential features")
+    res_q2a = assign_segment_to_question(
+        exam_id=eid,
+        student_id=sid,
+        question_id="Q2A",
+        start_char=0,
+        end_char=split_q2b,
+    )
+    subs_1 = res_q2a["submissions"]
+    assert any(s["question_id"] == "Q2A" for s in subs_1)
+    q2a_card = [s for s in subs_1 if s["question_id"] == "Q2A"][0]
+    assert "fundamental research" in q2a_card["transcribed_text"].lower()
+    assert q2a_card["ai_score"] > 0
+
+    # 2. Assign Q2B, Q3A, Q3B
+    split_q3a = raw_text.find("Techniques for defining")
+    split_q3b = raw_text.find("Concepts associated")
+
+    assign_segment_to_question(eid, sid, "Q2B", start_char=split_q2b, end_char=split_q3a)
+    assign_segment_to_question(eid, sid, "Q3A", start_char=split_q3a, end_char=split_q3b)
+    res_final = assign_segment_to_question(eid, sid, "Q3B", start_char=split_q3b, end_char=len(raw_text))
+
+    final_subs = res_final["submissions"]
+    qids = {s["question_id"] for s in final_subs}
+    assert {"Q2A", "Q2B", "Q3A", "Q3B"}.issubset(qids)
+
+    # Verify SDMCET IA total (max(Q1=0, Q2) + Q3)
+    ia = res_final["ia_breakdown"]
+    assert ia["chosen_pair"] == "Q2"
+    assert ia["q2_total"] > 0
+    assert ia["q3_total"] > 0
+    assert ia["ia_total"] == round(ia["q2_total"] + ia["q3_total"], 2)
+    print("  [ok] assign_segment starting at index 0 and live SDMCET IA calculation")
+
+
+def test_split_at_cursor_index_0_and_positive():
+    """Verify split_at_cursor with index 0 (reassignment) and index > 0 (two-way split)."""
+    init_db()
+    eid = "IA1_RM_2026"
+    sid = "TEST_STUDENT_SPLIT_CURSOR"
+
+    # Setup a Q1A submission that was mistakenly assigned
+    text_q1a = (
+        "First half: Dependent and independent variables are crucial in research design.\n"
+        "Second half: Extraneous variables must be controlled with proper hypotheses."
+    )
+    save_student_answer(eid, sid, "Q1A", ["page_1.png"], text_q1a)
+
+    # 1. Test cursor_index == 0: Full reassignment from Q1A to Q3B
+    res_reassign = split_at_cursor(
+        exam_id=eid,
+        student_id=sid,
+        source_question_id="Q1A",
+        cursor_index=0,
+        target_question_id="Q3B",
+    )
+    subs = res_reassign["submissions"]
+    qids = {s["question_id"] for s in subs}
+    assert "Q1A" not in qids, f"Q1A was not deleted: {qids}"
+    assert "Q3B" in qids, f"Q3B missing: {qids}"
+    q3b_card = [s for s in subs if s["question_id"] == "Q3B"][0]
+    assert "dependent and independent" in q3b_card["transcribed_text"].lower()
+
+    # 2. Test cursor_index > 0: Two-way split of Q3B into Q3A and Q3B
+    split_pt = q3b_card["transcribed_text"].find("Second half:")
+    res_split = split_at_cursor(
+        exam_id=eid,
+        student_id=sid,
+        source_question_id="Q3B",
+        cursor_index=split_pt,
+        target_question_id="Q3A",
+    )
+    subs_split = res_split["submissions"]
+    qids_split = {s["question_id"] for s in subs_split}
+    assert "Q3A" in qids_split and "Q3B" in qids_split
+    print("  [ok] split_at_cursor at index 0 (reassignment) and index > 0 (two-way split)")
+
+
+def test_delete_student_submission():
+    """Verify deleting an assigned question submission."""
+    init_db()
+    eid = "IA1_RM_2026"
+    sid = "TEST_STUDENT_DELETE"
+    save_student_answer(eid, sid, "Q1A", ["p.png"], "Research definition.")
+    save_student_answer(eid, sid, "Q1B", ["p.png"], "Literature review.")
+
+    subs = get_exam_submissions(eid, sid)
+    assert len(subs) == 2
+
+    res_del = delete_student_submission(eid, sid, "Q1A")
+    subs_after = res_del["submissions"]
+    qids = {s["question_id"] for s in subs_after}
+    assert "Q1A" not in qids
+    assert "Q1B" in qids
+    print("  [ok] delete_student_submission cleanly deletes and updates IA breakdown")
+
+
+def test_merge_and_reassign_and_split():
+    """Verify backend merge_and_reassign_submissions and split_submission atomic operations."""
+    init_db()
+    eid = "IA1_RM_2026"
+    sid = "TEST_STUDENT_001"
+
+    conn = get_connection()
+    conn.cursor().execute("DELETE FROM submissions WHERE student_id=?", (sid,))
+    conn.commit()
+    conn.close()
+
+    save_student_answer(eid, sid, "Q1A", ["dummy1.png"], "First part of the answer describing types of research.")
+    save_student_answer(eid, sid, "Q1B", ["dummy2.png"], "Second part mentioning fundamental and applied research.")
+    save_student_answer(eid, sid, "Q2A", ["dummy3.png"], "Third part covering descriptive and analytical examples.")
+
+    subs = get_exam_submissions(eid, sid)
+    qids = {s["question_id"] for s in subs}
+    assert {"Q1A", "Q1B", "Q2A"}.issubset(qids)
+
+    # 1. Test Merge & Re-Assign
+    merge_result = merge_and_reassign_submissions(
+        exam_id=eid,
+        student_id=sid,
+        source_question_ids=["Q1A", "Q1B", "Q2A"],
+        target_question_id="Q2A",
+    )
+    merged_subs = merge_result["submissions"]
+    merged_qids = {s["question_id"] for s in merged_subs}
+    assert "Q1A" not in merged_qids, f"Q1A was not deleted: {merged_qids}"
+    assert "Q1B" not in merged_qids, f"Q1B was not deleted: {merged_qids}"
+    assert "Q2A" in merged_qids, f"Q2A missing in {merged_qids}"
+
+    q2a_sub = [s for s in merged_subs if s["question_id"] == "Q2A"][0]
+    assert "First part" in q2a_sub["transcribed_text"]
+    assert "Second part" in q2a_sub["transcribed_text"]
+    assert "Third part" in q2a_sub["transcribed_text"]
+    assert q2a_sub["ai_score"] is not None
+    assert merge_result["ia_breakdown"]["ia_total"] > 0
+
+    # 2. Test Split Submission
+    split_index = q2a_sub["transcribed_text"].find("Third part")
+    assert split_index > 0
+    split_result = split_submission(
+        exam_id=eid,
+        student_id=sid,
+        source_question_id="Q2A",
+        split_index=split_index,
+        new_question_id="Q2B",
+    )
+    split_subs = split_result["submissions"]
+    split_qids = {s["question_id"] for s in split_subs}
+    assert "Q2A" in split_qids
+    assert "Q2B" in split_qids
+
+    q2a_after = [s for s in split_subs if s["question_id"] == "Q2A"][0]
+    q2b_after = [s for s in split_subs if s["question_id"] == "Q2B"][0]
+    assert "First part" in q2a_after["transcribed_text"]
+    assert "Third part" not in q2a_after["transcribed_text"]
+    assert "Third part" in q2b_after["transcribed_text"]
+    print("  [ok] merge_and_reassign_submissions and split_submission atomic operations & IA total re-calc")
 
 
 def test_generation_kwargs_clean_sampling():
@@ -339,14 +592,33 @@ def test_sanitize_hallucinations_and_coordinate_stripping():
     stripped_direct = _strip_coordinates_and_noise("(25,47),(998,950)\nValid handwriting\n(10,20)")
     assert "(25,47)" not in stripped_direct
     assert "Valid handwriting" in stripped_direct
-    print("  [ok] OCR sanitizer & coordinate stripping ((25,47),(998,950) removed cleanly)")
+
+    # Verify preserving student sub-points like (i), (ii), 2 (6), and 36) Concepts with Research design:
+    subpoints_text = (
+        "(25,47),(998,950)\n"
+        "(i) Introduction to research methodologies.\n"
+        "(ii) Systematic empirical observation.\n"
+        "2 (6) Literature review protocols.\n"
+        "36) Concepts with Research design:\n"
+        "(100, 200), (300, 400)\n"
+        "Independent and dependent variables."
+    )
+    preserved = _strip_coordinates_and_noise(subpoints_text)
+    assert "(25,47)" not in preserved
+    assert "(998,950)" not in preserved
+    assert "(100, 200)" not in preserved
+    assert "(i) Introduction" in preserved
+    assert "(ii) Systematic" in preserved
+    assert "2 (6) Literature" in preserved
+    assert "36) Concepts with Research design:" in preserved
+    assert "Independent and dependent variables." in preserved
+    print("  [ok] OCR sanitizer & coordinate stripping ((25,47),(998,950) removed while preserving (i), (ii), 2 (6), 36))")
 
 
 def test_choice_rule():
     # Case 1: Q1 > Q2
     scores = {"Q1A": 4.0, "Q1B": 3.5, "Q2A": 2.0, "Q2B": 2.0, "Q3A": 5.0, "Q3B": 4.0}
     result = calculate_ia_total(scores)
-    # max(7.5, 4.0) + 9.0 = 16.5 / 20
     assert_eq(result["ia_total"], 16.5, "IA total")
     assert_eq(result["chosen_pair"], "Q1", "chosen pair")
     assert_eq(result["q3_total"], 9.0, "Q3 total")
@@ -354,7 +626,6 @@ def test_choice_rule():
     # Case 2: Q2 > Q1
     scores2 = {"Q1A": 1.0, "Q1B": 1.0, "Q2A": 5.0, "Q2B": 4.5, "Q3A": 3.0, "Q3B": 3.0}
     result2 = calculate_ia_total(scores2)
-    # max(2.0, 9.5) + 6.0 = 15.5 / 20
     assert_eq(result2["ia_total"], 15.5, "IA total prefers Q2")
     assert_eq(result2["chosen_pair"], "Q2", "chosen pair Q2")
 
@@ -407,41 +678,51 @@ def test_database_and_calibration():
     print("  [ok] database seed & live weight calibration")
 
 
-def test_transcribe_images_prompt_and_grounding_fix():
-    """Verify transcribe_images uses single user message with explicit negative constraint against grounding."""
+def test_transcribe_images_fallback_retry_recovers_page():
+    """Verify that when Attempt 1 returns < 15 words, transcribe_images triggers Attempt 2 Top/Bottom split pass and recovers the full page transcription."""
+    from PIL import Image
+    import tempfile
+
     engine = LocalGradingEngine()
-    captured_messages = []
+    call_log = []
 
     def mock_generate(messages, **kwargs):
-        captured_messages.append(messages)
-        return "Q1A) Research is systematic enquiry."
+        user_content = messages[0]["content"]
+        user_text = [item["text"] for item in user_content if item["type"] == "text"][0]
+        call_log.append(user_text)
+
+        # If it's Attempt 1 (full page with prompt_attempt1), return few words (simulating failure/grounding coordinates)
+        if "top to bottom" in user_text:
+            return "(25,47),(998,950) only two words"
+        # If it's Attempt 2 (split halves), return real words
+        elif "visible in this image" in user_text:
+            return "Research is a systematic and sequential process of defining and analyzing problems."
+        return "Fallback text"
 
     engine._generate_text = mock_generate
 
-    import tempfile
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         dummy_path = f.name
-        f.write(b"\x89PNG\r\n")
+
+    # Save a valid test image with PIL
+    img = Image.new("RGB", (400, 800), color="white")
+    img.save(dummy_path)
 
     try:
-        result = engine.transcribe_images([dummy_path])
-        assert len(captured_messages) == 1, f"Expected 1 call, got {len(captured_messages)}"
-        msgs = captured_messages[0]
-        # Single user message (no grounding-inducing system message)
-        assert len(msgs) == 1, f"Expected 1 user message, got {len(msgs)}"
-        assert msgs[0]["role"] == "user", f"Role should be 'user', got '{msgs[0]['role']}'"
+        result = engine.transcribe_images([dummy_path], auto_unload=False)
+        # Check call_log: Attempt 1 was called first, then Attempt 2 (top half and bottom half)
+        assert len(call_log) >= 3, f"Expected at least 3 calls (1 initial + 2 halves), got {len(call_log)}"
+        assert "coordinates" not in call_log[0].lower(), "Attempt 1 prompt should NOT mention coordinates"
+        assert "(25,47)" not in call_log[0], "Attempt 1 prompt should NOT mention (25,47)"
+        assert "top to bottom" in call_log[0], "Attempt 1 prompt missing positive instruction"
 
-        user_content = msgs[0]["content"]
-        content_types = [item["type"] for item in user_content]
-        assert "image" in content_types, f"User message missing image: {content_types}"
-        assert "text" in content_types, f"User message missing text: {content_types}"
-
-        user_text = [item["text"] for item in user_content if item["type"] == "text"][0]
-        assert "coordinates or numbers in parentheses like (25,47),(998,950)" in user_text
-        assert "q1] a]" in user_text.lower()
-        print("  [ok] transcribe_images prompt has explicit grounding fix and margin rules")
+        # Check that result contains the recovered text from Attempt 2
+        assert "systematic and sequential process" in result
+        assert "--- Page 1 ---" in result
+        print("  [ok] 3-stage fallback: Attempt 1 <15 words automatically triggers Attempt 2 Top/Bottom split pass and recovers full page")
     finally:
-        os.remove(dummy_path)
+        if os.path.exists(dummy_path):
+            os.remove(dummy_path)
 
 
 def test_edueval_deterministic_scoring_q1a():
@@ -484,7 +765,6 @@ def test_edueval_deterministic_scoring_q1a():
     assert len(matched) >= 3, f"Expected at least 3 matched points, got {len(matched)}: {matched}"
     assert len(feedback) > 20, f"Empty or too short feedback: {feedback}"
 
-    # Also test via engine.evaluate_answer() integration
     engine = LocalGradingEngine()
     engine_result = engine.evaluate_answer(
         question_text=question_text,
@@ -497,6 +777,147 @@ def test_edueval_deterministic_scoring_q1a():
     print(f"  [ok] EduEval deterministic grading awarded {score}/{max_marks} marks with {len(matched)} criteria matched")
 
 
+def test_dump_q1a_split_char0_and_evaluate_workflow():
+    """
+    End-to-end integration test of the 3-step teacher workflow:
+    1. Step 1 (Upload/OCR): Dump full booklet verbatim into Q1A (ai_score=0.0, status='Transcribed').
+    2. Step 2 (Cursor Split at index 0): Move entire text from Q1A to Q2A (deleting empty Q1A).
+       Then sequential cursor splits (> 0) into Q2B, Q3A, Q3B.
+    3. Step 3 (On-Demand Evaluation): Call POST /api/submissions/evaluate-student.
+       Verify all cards are graded with EduEval, scores > 0, feedback populated,
+       and SDMCET IA Choice Rule (max(Q1=0, Q2) + Q3) calculated correctly.
+    """
+    from fastapi.testclient import TestClient
+    from main import app
+
+    init_db()
+    eid = "IA1_RM_2026"
+    sid = "TEST_STUDENT_3STEP"
+    client = TestClient(app)
+
+    # Clean any prior state for this test student
+    delete_all_student_submissions(eid, sid)
+
+    # 1. Step 1: Simulate OCR dump of entire booklet into Q1A
+    booklet_text = (
+        "Classify and explain the different types of research with examples:\n"
+        "Fundamental or pure research is driven by curiosity and theoretical understanding.\n"
+        "Applied research aims to find direct solutions for pressing practical problems.\n"
+        "Descriptive research reports things as they exist without manipulating variables, "
+        "while analytical research uses existing data for critical evaluation.\n\n"
+        "Essential features of a good research design:\n"
+        "A sound research design should be flexible, appropriate, efficient, and cost-effective.\n"
+        "It minimizes experimental error and bias while maximizing the reliability of the collected evidence.\n\n"
+        "Explain the various techniques used for defining a research problem:\n"
+        "Techniques include stating the problem in a general way, understanding its origin and nature, "
+        "surveying relevant literature, and formulating clear operational hypotheses.\n\n"
+        "Discuss the important concepts associated with research design:\n"
+        "Key concepts include independent variables, dependent variables, extraneous variables, "
+        "control mechanisms, and hypothesis testing."
+    )
+    save_student_answer(eid, sid, "Q1A", ["test_page_1.png", "test_page_2.png"], booklet_text)
+    save_raw_booklet(eid, sid, ["test_page_1.png", "test_page_2.png"], booklet_text)
+
+    # Verify Step 1 initial state: Exactly 1 card (Q1A) with score 0.0 and status Transcribed
+    subs_initial = get_exam_submissions(eid, sid)
+    assert len(subs_initial) == 1, f"Expected 1 initial submission, got {len(subs_initial)}"
+    assert subs_initial[0]["question_id"] == "Q1A"
+    assert subs_initial[0]["ai_score"] == 0.0
+    assert subs_initial[0]["status"] == "Transcribed"
+
+    # 2. Step 2a: split_index == 0 reassigns Q1A to Q2A and deletes empty Q1A
+    resp_char0 = client.post("/api/submissions/split", json={
+        "exam_id": eid,
+        "student_id": sid,
+        "source_question_id": "Q1A",
+        "target_question_id": "Q2A",
+        "split_index": 0,
+    })
+    assert resp_char0.status_code == 200, f"split_index=0 failed: {resp_char0.text}"
+    subs_char0 = resp_char0.json()["submissions"]
+    qids_char0 = {s["question_id"] for s in subs_char0}
+    assert "Q1A" not in qids_char0, f"Q1A was not deleted: {qids_char0}"
+    assert "Q2A" in qids_char0, f"Q2A missing after split_index=0: {qids_char0}"
+    assert len(subs_char0) == 1
+
+    # 2. Step 2b: Sequential splits with split_index > 0
+    # Split Q2A -> Q2B
+    q2a_card = [s for s in subs_char0 if s["question_id"] == "Q2A"][0]
+    split_q2b = q2a_card["transcribed_text"].find("Essential features")
+    assert split_q2b > 0, "Could not find split boundary for Q2B"
+
+    resp_q2b = client.post("/api/submissions/split", json={
+        "exam_id": eid,
+        "student_id": sid,
+        "source_question_id": "Q2A",
+        "target_question_id": "Q2B",
+        "split_index": split_q2b,
+    })
+    assert resp_q2b.status_code == 200
+    subs_q2b = resp_q2b.json()["submissions"]
+    qids_q2b = {s["question_id"] for s in subs_q2b}
+    assert qids_q2b == {"Q2A", "Q2B"}
+
+    # Split Q2B -> Q3A
+    q2b_card = [s for s in subs_q2b if s["question_id"] == "Q2B"][0]
+    split_q3a = q2b_card["transcribed_text"].find("Explain the various techniques")
+    assert split_q3a > 0, "Could not find split boundary for Q3A"
+
+    resp_q3a = client.post("/api/submissions/split", json={
+        "exam_id": eid,
+        "student_id": sid,
+        "source_question_id": "Q2B",
+        "target_question_id": "Q3A",
+        "split_index": split_q3a,
+    })
+    assert resp_q3a.status_code == 200
+    subs_q3a = resp_q3a.json()["submissions"]
+    qids_q3a = {s["question_id"] for s in subs_q3a}
+    assert qids_q3a == {"Q2A", "Q2B", "Q3A"}
+
+    # Split Q3A -> Q3B
+    q3a_card = [s for s in subs_q3a if s["question_id"] == "Q3A"][0]
+    split_q3b = q3a_card["transcribed_text"].find("Discuss the important concepts")
+    assert split_q3b > 0, "Could not find split boundary for Q3B"
+
+    resp_q3b = client.post("/api/submissions/split", json={
+        "exam_id": eid,
+        "student_id": sid,
+        "source_question_id": "Q3A",
+        "target_question_id": "Q3B",
+        "split_index": split_q3b,
+    })
+    assert resp_q3b.status_code == 200
+    subs_final = resp_q3b.json()["submissions"]
+    qids_final = sorted([s["question_id"] for s in subs_final])
+    assert qids_final == ["Q2A", "Q2B", "Q3A", "Q3B"], f"Unexpected question set: {qids_final}"
+
+    # 3. Step 3: Trigger On-Demand Evaluation across all 4 assigned cards
+    resp_eval = client.post("/api/submissions/evaluate-student", json={
+        "exam_id": eid,
+        "student_id": sid,
+    })
+    assert resp_eval.status_code == 200, f"evaluate-student failed: {resp_eval.text}"
+    eval_data = resp_eval.json()
+    evaluated_subs = eval_data["submissions"]
+    assert len(evaluated_subs) == 4
+
+    for sub in evaluated_subs:
+        qid = sub["question_id"]
+        assert sub["ai_score"] > 0, f"{qid} ai_score was not graded: {sub['ai_score']}"
+        assert len(sub["matched_points"]) > 0, f"{qid} has 0 matched points"
+        assert len(sub["ai_feedback"]) > 10, f"{qid} ai_feedback is empty or too short"
+
+    # Verify SDMCET IA Choice Rule breakdown: max(Q1=0, Q2) + Q3
+    ia = eval_data["ia_breakdown"]
+    assert ia["chosen_pair"] == "Q2", f"Expected Q2 chosen, got {ia['chosen_pair']}"
+    assert ia["q1_total"] == 0.0
+    assert ia["q2_total"] > 0.0
+    assert ia["q3_total"] > 0.0
+    assert eval_data["ia_total"] == round(ia["q2_total"] + ia["q3_total"], 2)
+    print(f"  [ok] 3-step workflow: Dump Q1A -> Char 0 Reassign -> Split Q2B/Q3A/Q3B -> EduEval IA Total: {eval_data['ia_total']}/20")
+
+
 if __name__ == "__main__":
     print("Running EvalAI pipeline tests...")
     test_margin_normalization()
@@ -505,11 +926,19 @@ if __name__ == "__main__":
     test_multipage_continuation_chunking()
     test_multi_tier_margin_segmentation()
     test_booklet_chunking_test_pdf_and_test1_pdf()
+    test_roman_numerals_and_internal_lists_no_split()
+    test_orphan_subquestion_semantic_routing()
+    test_raw_booklet_persistence()
+    test_assign_segment_with_index_0_and_all_questions()
+    test_split_at_cursor_index_0_and_positive()
+    test_delete_student_submission()
+    test_merge_and_reassign_and_split()
+    test_dump_q1a_split_char0_and_evaluate_workflow()
     test_generation_kwargs_clean_sampling()
     test_sanitize_hallucinations_and_coordinate_stripping()
     test_choice_rule()
     test_teacher_parse_and_rubric()
     test_database_and_calibration()
-    test_transcribe_images_prompt_and_grounding_fix()
+    test_transcribe_images_fallback_retry_recovers_page()
     test_edueval_deterministic_scoring_q1a()
     print("\nAll EvalAI pipeline tests passed successfully!")
