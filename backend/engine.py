@@ -182,15 +182,27 @@ SIGN_OFF_RE = re.compile(
 )
 
 PREFIX_RE = re.compile(
-    r"^(?:Here is (?:the|a) transcription[^\n]*\n|Here is what is written[^\n]*\n)",
+    r"^(?:(?:Certainly!?|Sure!?|Here is (?:the|a) transcription[^\n]*|Here is what is written[^\n]*)\n?)+",
     re.IGNORECASE,
 )
 
 
 def _strip_coordinates_and_noise(text: str) -> str:
-    """Strips bounding box coordinates, grounding tags, and synthetic quiz blocks without deleting student text."""
+    """Strips bounding box coordinates, grounding tags, conversational filler, code fences, runaway numbers, and synthetic quiz blocks without deleting student text."""
     if not text:
         return ""
+
+    # Leading conversational filler and code fences at start and end
+    for _ in range(3):
+        text = re.sub(
+            r"^\s*(?:(?:Certainly!?|Sure!?|Here is (?:the )?transcription[^\n]*)\s*)+",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(r"^\s*```(?:markdown|text)?\s*\n?", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\n?\s*```\s*$", "", text, flags=re.IGNORECASE)
+
     # Coordinate pairs: r'\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\)\s*(?:,\s*\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\))?'
     text = re.sub(
         r"\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\)\s*(?:,\s*\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\))?",
@@ -204,6 +216,10 @@ def _strip_coordinates_and_noise(text: str) -> str:
     text = re.sub(r"</?(?:ref|box|quad)>", "", text)
     # Hallucinated quiz blocks: r'(?i)(?:^|\n)\s*(?:#+\s*)?Question\s+\d+\s*:\s*What\b.*'
     text = re.sub(r"(?i)(?:^|\n)\s*(?:#+\s*)?Question\s+\d+\s*:\s*What\b.*", "", text)
+
+    # Runaway sequential number runs of 8 or more space/newline-separated numbers (keeping short numbers/years/question markers intact)
+    text = re.sub(r"(?:\b\d+\b(?![)\]:.-])[\s,]*){8,}", "", text)
+
     return text.strip()
 
 
@@ -232,8 +248,9 @@ def sanitize_ocr_text(text: str) -> str:
     return text
 
 
-def _preprocess_page_image(image_path: str) -> str:
-    """Enhance contrast and sharpness for faint handwritten blue ink and lined backgrounds."""
+def _preprocess_page_image(image_path: str, top_margin_ratio: float = 0.12) -> str:
+    """Enhance contrast and sharpness for faint handwritten blue ink and lined backgrounds,
+    cropping out the top header margin (default 12%)."""
     if not os.path.exists(image_path):
         return image_path
     try:
@@ -241,7 +258,11 @@ def _preprocess_page_image(image_path: str) -> str:
         import tempfile
         with Image.open(image_path) as img:
             rgb_img = img.convert("RGB")
-            contrasted = ImageOps.autocontrast(rgb_img, cutoff=1)
+            w, h = rgb_img.size
+            top_crop_y = int(h * top_margin_ratio) if top_margin_ratio > 0 else 0
+            crop_box = (0, top_crop_y, w, h)
+            cropped = rgb_img.crop(crop_box)
+            contrasted = ImageOps.autocontrast(cropped, cutoff=1)
             contrasted = ImageEnhance.Contrast(contrasted).enhance(1.35)
             sharpened = ImageEnhance.Sharpness(contrasted).enhance(1.5)
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
@@ -254,13 +275,15 @@ def _preprocess_page_image(image_path: str) -> str:
         return image_path
 
 
-def _crop_horizontal_halves(image_path: str) -> Tuple[str, str]:
-    """Crops the image horizontally into two overlapping halves (0-55% and 45-100% height)."""
+def _crop_horizontal_halves(image_path: str, top_crop_ratio: float = 0.0) -> Tuple[str, str]:
+    """Crops the image horizontally into two overlapping halves (0-55% and 45-100% height),
+    optionally applying a top crop if the image has not already been preprocessed."""
     from PIL import Image
     import tempfile
     with Image.open(image_path) as img:
         w, h = img.size
-        top_box = (0, 0, w, int(h * 0.55))
+        top_crop_y = int(h * top_crop_ratio) if top_crop_ratio > 0 else 0
+        top_box = (0, top_crop_y, w, int(h * 0.55))
         bottom_box = (0, int(h * 0.45), w, h)
         top_half = img.crop(top_box)
         bottom_half = img.crop(bottom_box)
@@ -474,10 +497,15 @@ class LocalGradingEngine:
     ) -> str:
         """Digitize handwritten booklet pages verbatim with 3-stage fallback guarantee (no page skipped)."""
         prompt_attempt1 = (
-            "Transcribe all handwritten text from this exam answer sheet page from top to bottom. "
-            "Include all headings, margin numbers (such as a), 2(b), 3a, 3b), bullet points, and definitions."
+            "Transcribe only the handwritten answer text visible below the top header line on this lined answer sheet from top to bottom, line by line. "
+            "Preserve margin question numbers (such as a), 2] (b), 3] a, 3b) and headings exactly as written. "
+            "Output only the plain transcribed text with no introductory text, no markdown code blocks, and no sequential number lists."
         )
-        prompt_split = "Read and transcribe every handwritten line visible in this image:"
+        prompt_split = (
+            "Read and transcribe every handwritten line visible in this image below the top header line: "
+            "Preserve margin question numbers and headings exactly as written. "
+            "Output only plain transcribed text with no introductory text and no markdown code blocks."
+        )
         pages_md = []
         total = len(image_paths)
         try:
@@ -520,7 +548,8 @@ class LocalGradingEngine:
                     if words_count < 15:
                         print(f"[*] Page {idx + 1} produced only {words_count} words (<15 words). Running Attempt 2 (Top/Bottom Split Pass)...")
                         try:
-                            p_top, p_bot = _crop_horizontal_halves(enhanced_path)
+                            fallback_top = 0.12 if enhanced_path == img_path else 0.0
+                            p_top, p_bot = _crop_horizontal_halves(enhanced_path, top_crop_ratio=fallback_top)
                             cleanup_files.extend([p_top, p_bot])
                             top_text = self._generate_text(
                                 [{"role": "user", "content": [{"type": "image", "image": p_top}, {"type": "text", "text": prompt_split}]}],

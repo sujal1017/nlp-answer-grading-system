@@ -10,6 +10,7 @@ from engine import (
     generate_atomic_rubric,
     sanitize_ocr_text,
     _strip_coordinates_and_noise,
+    _preprocess_page_image,
     LocalGradingEngine,
     extract_left_margin_marker,
 )
@@ -615,6 +616,79 @@ def test_sanitize_hallucinations_and_coordinate_stripping():
     print("  [ok] OCR sanitizer & coordinate stripping ((25,47),(998,950) removed while preserving (i), (ii), 2 (6), 36))")
 
 
+def test_strip_chat_prefixes_and_runaway_numbers():
+    """Verify _strip_coordinates_and_noise removes chat prefixes, markdown wrappers, and runaway numbers while preserving handwritten text and short numbers."""
+    # 1. Leading conversational filler and ```markdown wrappers
+    filler_input = (
+        "Certainly! Here is the transcription of the handwritten answer sheet:\n"
+        "```markdown\n"
+        "2] a) Research is defined as a systematic process to identify problems.\n"
+        "```"
+    )
+    cleaned_filler = _strip_coordinates_and_noise(filler_input)
+    assert cleaned_filler == "2] a) Research is defined as a systematic process to identify problems.", f"Got: {cleaned_filler}"
+
+    # 2. Runaway sequential number sequence (e.g. 1 2 3 ... 12)
+    runaway_input = (
+        "1 2 3 4 5 6 7 8 9 10 11 12\n"
+        "2] a) Concepts with research design:\n"
+        "36) Sampling methods include random and stratified sampling."
+    )
+    cleaned_runaway = _strip_coordinates_and_noise(runaway_input)
+    assert "1 2 3 4 5 6 7 8 9 10 11 12" not in cleaned_runaway
+    assert "2] a) Concepts with research design:" in cleaned_runaway
+    assert "36) Sampling methods include random and stratified sampling." in cleaned_runaway
+
+    # 3. Combined test with filler, wrappers, runaway numbers, short numbers, and years
+    combined_input = (
+        "Certainly! Here is the transcription...\n"
+        "```markdown\n"
+        "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16\n"
+        "2] a) Classify and explain the different types of research with examples:\n"
+        "In 2024, step 1 and step 2 were evaluated.\n"
+        "36) Concepts associated with research design.\n"
+        "```"
+    )
+    cleaned_combined = _strip_coordinates_and_noise(combined_input)
+    assert "Certainly!" not in cleaned_combined
+    assert "```" not in cleaned_combined
+    assert "1 2 3 4" not in cleaned_combined
+    assert "2] a) Classify and explain the different types of research with examples:" in cleaned_combined
+    assert "In 2024, step 1 and step 2 were evaluated." in cleaned_combined
+    assert "36) Concepts associated with research design." in cleaned_combined
+    print("  [ok] _strip_coordinates_and_noise removes chat prefixes, markdown fences, and runaway numbers while preserving 2] a), 36), and content")
+
+
+def test_preprocess_page_image_crops_top_margin():
+    """Verify _preprocess_page_image crops out the top ~12% height (crop_box[1] >= int(h * 0.10))."""
+    from PIL import Image
+    import tempfile
+
+    w, h = 800, 1200
+    img = Image.new("RGB", (w, h), color="white")
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        dummy_img_path = f.name
+    img.save(dummy_img_path)
+
+    try:
+        preprocessed_path = _preprocess_page_image(dummy_img_path)
+        assert preprocessed_path != dummy_img_path, "Expected preprocessed temp image path"
+        assert os.path.exists(preprocessed_path), "Preprocessed image file does not exist"
+
+        with Image.open(preprocessed_path) as res_img:
+            w_res, h_res = res_img.size
+            top_cropped = h - h_res
+            assert w_res == w, f"Expected width {w}, got {w_res}"
+            assert top_cropped >= int(h * 0.10), f"Expected top crop >= {int(h * 0.10)}, got {top_cropped}"
+            assert top_cropped == int(h * 0.12), f"Expected top crop == {int(h * 0.12)}, got {top_cropped}"
+            print(f"  [ok] _preprocess_page_image cropped {top_cropped}px top margin (>= 10% of {h}px)")
+    finally:
+        if os.path.exists(dummy_img_path):
+            os.remove(dummy_img_path)
+        if "preprocessed_path" in locals() and os.path.exists(preprocessed_path):
+            os.remove(preprocessed_path)
+
+
 def test_choice_rule():
     # Case 1: Q1 > Q2
     scores = {"Q1A": 4.0, "Q1B": 3.5, "Q2A": 2.0, "Q2B": 2.0, "Q3A": 5.0, "Q3B": 4.0}
@@ -667,10 +741,12 @@ def test_database_and_calibration():
     assert kpis["booklets"] >= 1
 
     # Test weight calibration feedback
+    subs = get_exam_submissions(eid, "2SD23CS082")
+    calib_qid = "Q1A" if any(s["question_id"] == "Q1A" for s in subs) else subs[0]["question_id"]
     updated = update_rubric_weights_from_feedback(
         exam_id=eid,
         student_id="2SD23CS082",
-        question_id="Q1A",
+        question_id=calib_qid,
         teacher_score=4.5,
     )
     assert updated is not None
@@ -936,6 +1012,8 @@ if __name__ == "__main__":
     test_dump_q1a_split_char0_and_evaluate_workflow()
     test_generation_kwargs_clean_sampling()
     test_sanitize_hallucinations_and_coordinate_stripping()
+    test_strip_chat_prefixes_and_runaway_numbers()
+    test_preprocess_page_image_crops_top_margin()
     test_choice_rule()
     test_teacher_parse_and_rubric()
     test_database_and_calibration()
