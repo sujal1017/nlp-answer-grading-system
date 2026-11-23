@@ -17,6 +17,7 @@ import {
   Zap,
   Search,
   CornerDownRight,
+  FileSpreadsheet,
 } from "lucide-react";
 import {
   getBooklet,
@@ -38,9 +39,9 @@ function defaultTargetFor(qid) {
   return "Q1A";
 }
 
-export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
+export default function ReviewGrade({ examId, refreshKey, onCalibrated, initialStudentId, onGoToLedger }) {
   const [students, setStudents] = useState([]);
-  const [selected, setSelected] = useState("");
+  const [selected, setSelected] = useState(initialStudentId || "");
   const [booklet, setBooklet] = useState(null);
   const [rows, setRows] = useState([]);
   const [ia, setIa] = useState(null);
@@ -68,7 +69,7 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
       const { data: subData } = await getSubmissions(examId, studentId || undefined);
       const studentList = subData.students || [];
       setStudents(studentList);
-      const pick = studentId || studentList[0] || "";
+      const pick = studentId || initialStudentId || selected || studentList[0] || "";
       setSelected(pick);
 
       if (pick) {
@@ -365,11 +366,23 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
               </span>
             </div>
           </div>
-          <div className="text-right">
-            <span className="text-xs font-semibold text-slate-500 block uppercase tracking-wide">Final IA Marks</span>
-            <span className="text-3xl font-extrabold text-indigo-600 tracking-tight">
-              {ia?.ia_total ?? 0} <span className="text-sm font-semibold text-slate-400">/ 20</span>
-            </span>
+          <div className="flex items-center gap-4">
+            {onGoToLedger && (
+              <button
+                type="button"
+                onClick={onGoToLedger}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 px-3 py-1.5 text-xs font-semibold text-slate-700 shadow-sm transition-colors"
+              >
+                <FileSpreadsheet className="w-3.5 h-3.5 text-indigo-600" />
+                View Marks Ledger
+              </button>
+            )}
+            <div className="text-right">
+              <span className="text-xs font-semibold text-slate-500 block uppercase tracking-wide">Final IA Marks</span>
+              <span className="text-3xl font-extrabold text-indigo-600 tracking-tight">
+                {ia?.ia_total ?? 0} <span className="text-sm font-semibold text-slate-400">/ 20</span>
+              </span>
+            </div>
           </div>
         </div>
       </div>

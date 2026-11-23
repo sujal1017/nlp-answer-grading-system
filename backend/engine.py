@@ -120,6 +120,54 @@ def generate_atomic_rubric(question_text: str, max_marks: float, num_points: int
     return [{"point": pt, "weight": w} for pt, w in zip(points, weights)]
 
 
+def generate_rubric_points(
+    question_text: str,
+    max_marks: float,
+    exam_id: Optional[str] = None,
+    num_points: int = 4,
+    engine: Optional["LocalGradingEngine"] = None,
+) -> List[Dict]:
+    """Generates atomic grading rubric criteria.
+    If exam_id is provided and reference textbook index exists, grounds the 4 atomic rubric criteria
+    in textbook excerpts using exact terminology and definitions from the prescribed textbook.
+    """
+    q = (question_text or "").strip()
+    if not q:
+        return []
+
+    ref_chunks = []
+    if exam_id:
+        try:
+            from rag import retrieve_textbook_context
+            ref_chunks = retrieve_textbook_context(exam_id, q, top_k=3)
+        except Exception as exc:
+            print(f"[!] Warning: RAG retrieval for rubric generation failed: {exc}")
+
+    if ref_chunks and engine is not None:
+        try:
+            ref_context = "\n\n".join(f"[Page {c['page']}] {c['text']}" for c in ref_chunks)
+            prompt = (
+                f"You are an expert university examiner. Given the question and reference textbook excerpts, "
+                f"generate {num_points} concise, atomic grading rubric criteria points.\n"
+                f"Each point must focus on a specific conceptual element, classification, definition, or methodology from the reference textbook.\n"
+                f"Output each rubric point on a new line starting with a number (e.g., 1., 2.), with no introductory text or markdown formatting.\n\n"
+                f"QUESTION: {q}\n"
+                f"MAX MARKS: {max_marks}\n\n"
+                f"REFERENCE TEXTBOOK CONTEXT:\n{ref_context}"
+            )
+            messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+            res = engine._generate_text(messages, max_tokens=256, temperature=0.1)
+            lines = [re.sub(r"^\s*\d+[\.\)\]\-:\s]*", "", ln).strip() for ln in res.splitlines() if ln.strip()]
+            valid_pts = [ln for ln in lines if len(ln) >= 10][:num_points]
+            if len(valid_pts) >= 2:
+                weights = calibrate_weights(len(valid_pts), max_marks)
+                return [{"point": pt, "weight": w} for pt, w in zip(valid_pts, weights)]
+        except Exception as exc:
+            print(f"[!] Warning: VLM textbook-grounded rubric generation failed, falling back to deterministic template: {exc}")
+
+    return generate_atomic_rubric(q, max_marks, num_points=num_points)
+
+
 def collapse_word_loops(text: str) -> str:
     """Cut hallucinated phrase loops such as repeating the same 6–20 word span."""
     words = text.split()
@@ -609,6 +657,7 @@ class LocalGradingEngine:
         key_points: List[Union[Dict, str]],
         student_answer: str,
         verified_examples: Optional[List[Dict]] = None,
+        exam_id: Optional[str] = None,
     ) -> Dict:
         """Evaluates student answer against rubric points using EduEval deterministic grader."""
         from scorer import evaluate_with_edueval
@@ -618,4 +667,5 @@ class LocalGradingEngine:
             key_points=key_points,
             student_answer=student_answer,
             verified_examples=verified_examples,
+            exam_id=exam_id,
         )

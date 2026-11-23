@@ -85,6 +85,143 @@ DEFAULT_SDMCET_QUESTIONS = [
 ]
 
 
+def update_exam_textbook(exam_id: str, filename: str):
+    """Updates textbook_filename for an exam."""
+    eid = exam_id.strip().upper()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE exams SET textbook_filename=? WHERE exam_id=?", (filename, eid))
+    conn.commit()
+    conn.close()
+
+
+def sync_student_result(exam_id: str, student_id: str, conn: Optional[sqlite3.Connection] = None) -> Dict:
+    """Auto-Sync Scorecard Function:
+    Queries all rows in submissions for (exam_id, student_id).
+    Uses teacher_score if teacher_verified == 1, else uses ai_score for each question (Q1A–Q3B).
+    Computes q1_total = q1a + q1b, q2_total = q2a + q2b, q3_total = q3a + q3b,
+    and final_ia_total = max(q1_total, q2_total) + q3_total.
+    Upserts the complete scorecard into student_results.
+    """
+    eid = exam_id.strip().upper()
+    sid = student_id.strip().upper()
+    close_conn = False
+    if conn is None:
+        conn = get_connection()
+        close_conn = True
+
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT question_id, ai_score, teacher_score, teacher_verified, status FROM submissions WHERE exam_id=? AND student_id=?",
+        (eid, sid),
+    )
+    rows = cursor.fetchall()
+    sub_map = {}
+    verified_count = 0
+    for r in rows:
+        qid = r["question_id"].upper()
+        t_score = r["teacher_score"]
+        t_ver = r["teacher_verified"]
+        ai_sc = r["ai_score"]
+        if t_ver == 1 and t_score is not None:
+            score = float(t_score)
+            verified_count += 1
+        else:
+            score = float(ai_sc or 0.0)
+        sub_map[qid] = score
+
+    q1a = sub_map.get("Q1A", 0.0)
+    q1b = sub_map.get("Q1B", 0.0)
+    q2a = sub_map.get("Q2A", 0.0)
+    q2b = sub_map.get("Q2B", 0.0)
+    q3a = sub_map.get("Q3A", 0.0)
+    q3b = sub_map.get("Q3B", 0.0)
+
+    q1_total = round(q1a + q1b, 2)
+    q2_total = round(q2a + q2b, 2)
+    q3_total = round(q3a + q3b, 2)
+    final_ia_total = round(max(q1_total, q2_total) + q3_total, 2)
+    total_answered = len(rows)
+
+    status = "evaluated"
+    if total_answered > 0 and verified_count == total_answered:
+        status = "verified"
+    elif total_answered == 0:
+        status = "not_started"
+
+    cursor.execute(
+        """
+        INSERT INTO student_results (
+            exam_id, student_id,
+            q1a_score, q1b_score, q2a_score, q2b_score, q3a_score, q3b_score,
+            q1_total, q2_total, q3_total, final_ia_total, max_ia_marks,
+            verified_count, total_questions_answered, status, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 20.0, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(exam_id, student_id) DO UPDATE SET
+            q1a_score = excluded.q1a_score,
+            q1b_score = excluded.q1b_score,
+            q2a_score = excluded.q2a_score,
+            q2b_score = excluded.q2b_score,
+            q3a_score = excluded.q3a_score,
+            q3b_score = excluded.q3b_score,
+            q1_total = excluded.q1_total,
+            q2_total = excluded.q2_total,
+            q3_total = excluded.q3_total,
+            final_ia_total = excluded.final_ia_total,
+            max_ia_marks = excluded.max_ia_marks,
+            verified_count = excluded.verified_count,
+            total_questions_answered = excluded.total_questions_answered,
+            status = excluded.status,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            eid, sid,
+            q1a, q1b, q2a, q2b, q3a, q3b,
+            q1_total, q2_total, q3_total, final_ia_total,
+            verified_count, total_answered, status,
+        ),
+    )
+    conn.commit()
+
+    scorecard = {
+        "exam_id": eid,
+        "student_id": sid,
+        "q1a_score": q1a,
+        "q1b_score": q1b,
+        "q2a_score": q2a,
+        "q2b_score": q2b,
+        "q3a_score": q3a,
+        "q3b_score": q3b,
+        "q1_total": q1_total,
+        "q2_total": q2_total,
+        "q3_total": q3_total,
+        "final_ia_total": final_ia_total,
+        "max_ia_marks": 20.0,
+        "verified_count": verified_count,
+        "total_questions_answered": total_answered,
+        "status": status,
+    }
+
+    if close_conn:
+        conn.close()
+
+    return scorecard
+
+
+def get_student_results(exam_id: str) -> List[Dict]:
+    """Returns all rows from student_results for the exam ordered by student_id ASC."""
+    eid = exam_id.strip().upper()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM student_results WHERE exam_id=? ORDER BY student_id ASC",
+        (eid,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def seed_default_exam(conn):
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM exams")
@@ -200,6 +337,26 @@ def seed_default_exam(conn):
                     ),
                 )
         conn.commit()
+        sync_student_result(exam_id, "2SD23CS082", conn=conn)
+    else:
+        # If exam exists, verify if rubrics need upgrading to 4 atomic criteria
+        cursor.execute("SELECT key_points FROM rubrics WHERE exam_id='IA1_RM_2026' AND question_id='Q1A'")
+        row = cursor.fetchone()
+        if row:
+            try:
+                pts = json.loads(row[0])
+                if len(pts) < 4:
+                    for q in DEFAULT_SDMCET_QUESTIONS:
+                        cursor.execute(
+                            """
+                            UPDATE rubrics SET question_text=?, max_marks=?, key_points=?
+                            WHERE exam_id='IA1_RM_2026' AND question_id=?
+                            """,
+                            (q["question_text"], q["max_marks"], json.dumps(q["key_points"]), q["question_id"]),
+                        )
+                    conn.commit()
+            except Exception:
+                pass
 
 
 def init_db():
@@ -275,8 +432,47 @@ def init_db():
         """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS student_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exam_id TEXT NOT NULL,
+            student_id TEXT NOT NULL,
+            q1a_score REAL DEFAULT 0.0,
+            q1b_score REAL DEFAULT 0.0,
+            q2a_score REAL DEFAULT 0.0,
+            q2b_score REAL DEFAULT 0.0,
+            q3a_score REAL DEFAULT 0.0,
+            q3b_score REAL DEFAULT 0.0,
+            q1_total REAL DEFAULT 0.0,
+            q2_total REAL DEFAULT 0.0,
+            q3_total REAL DEFAULT 0.0,
+            final_ia_total REAL DEFAULT 0.0,
+            max_ia_marks REAL DEFAULT 20.0,
+            verified_count INTEGER DEFAULT 0,
+            total_questions_answered INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'evaluated',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(exam_id, student_id)
+        )
+        """
+    )
+
+    # Safe ALTER TABLE migration for textbook_filename on exams table
+    cursor.execute("PRAGMA table_info(exams)")
+    exam_cols = [r["name"] if isinstance(r, sqlite3.Row) else r[1] for r in cursor.fetchall()]
+    if "textbook_filename" not in exam_cols:
+        cursor.execute("ALTER TABLE exams ADD COLUMN textbook_filename TEXT DEFAULT ''")
+
     conn.commit()
     seed_default_exam(conn)
+
+    # Ensure any existing student submissions have synced scorecards
+    cursor.execute("SELECT DISTINCT exam_id, student_id FROM submissions")
+    existing_students = cursor.fetchall()
+    for s_row in existing_students:
+        sync_student_result(s_row["exam_id"], s_row["student_id"], conn=conn)
+
     conn.close()
 
 
@@ -430,6 +626,7 @@ def delete_student_submission(exam_id: str, student_id: str, question_id: str) -
     )
     conn.commit()
     conn.close()
+    sync_student_result(eid, sid)
 
     from chunker import calculate_ia_total
     updated_subs = get_exam_submissions(eid, sid)
@@ -455,6 +652,7 @@ def delete_all_student_submissions(exam_id: str, student_id: str):
     )
     conn.commit()
     conn.close()
+    sync_student_result(eid, sid)
 
 
 def save_student_answer(
@@ -485,6 +683,7 @@ def save_student_answer(
     )
     conn.commit()
     conn.close()
+    sync_student_result(eid, sid)
 
 
 def update_evaluation(
@@ -525,6 +724,7 @@ def update_evaluation(
     )
     conn.commit()
     conn.close()
+    sync_student_result(eid, sid)
 
 
 def verify_submission(exam_id: str, student_id: str, question_id: str, teacher_score: float, ai_feedback: str):
@@ -546,6 +746,7 @@ def verify_submission(exam_id: str, student_id: str, question_id: str, teacher_s
     )
     conn.commit()
     conn.close()
+    sync_student_result(eid, sid)
 
 
 def get_exam_submissions(exam_id: str, student_id: Optional[str] = None) -> List[Dict]:
@@ -781,6 +982,7 @@ def assign_segment_to_question(
     )
     conn.commit()
     conn.close()
+    sync_student_result(eid, sid)
 
     updated_subs = get_exam_submissions(eid, sid)
     scores = {r["question_id"]: float(r["teacher_score"] or r["ai_score"] or 0.0) for r in updated_subs}
@@ -971,6 +1173,7 @@ def split_at_cursor(
             raise
 
     conn.close()
+    sync_student_result(eid, sid)
 
     updated_subs = get_exam_submissions(eid, sid)
     scores = {r["question_id"]: float(r["teacher_score"] or r["ai_score"] or 0.0) for r in updated_subs}
@@ -1092,6 +1295,7 @@ def merge_and_reassign_submissions(
         raise
 
     conn.close()
+    sync_student_result(eid, sid)
 
     updated_subs = get_exam_submissions(eid, sid)
     scores = {r["question_id"]: float(r["teacher_score"] or r["ai_score"] or 0.0) for r in updated_subs}

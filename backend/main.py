@@ -29,6 +29,7 @@ from database import (
     get_exam_submissions,
     get_kpi_counts,
     get_raw_booklet,
+    get_student_results,
     get_verified_examples,
     init_db,
     merge_and_reassign_submissions,
@@ -37,11 +38,14 @@ from database import (
     save_student_answer,
     split_at_cursor,
     split_submission,
+    sync_student_result,
     update_evaluation,
+    update_exam_textbook,
     update_rubric_weights_from_feedback,
     verify_submission,
 )
 from engine import LocalGradingEngine, generate_atomic_rubric
+from rag import index_textbook_pdf
 
 init_db()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -430,6 +434,7 @@ def evaluate_student_endpoint(payload: EvaluateStudentRequest):
                 key_points=r_info["key_points"],
                 student_answer=ans_text,
                 verified_examples=past,
+                exam_id=eid,
             )
             update_evaluation(
                 exam_id=eid,
@@ -440,6 +445,8 @@ def evaluate_student_endpoint(payload: EvaluateStudentRequest):
                 ai_score=eval_res["ai_score"],
                 ai_feedback=eval_res["ai_feedback"],
             )
+
+    sync_student_result(eid, sid)
 
     updated_subs = get_exam_submissions(eid, sid)
     for row in updated_subs:
@@ -689,6 +696,22 @@ def student_ia(exam_id: str, student_id: str):
     rows = get_exam_submissions(exam_id, student_id)
     scores = {r["question_id"]: float(r["teacher_score"] or 0.0) for r in rows}
     return {"scores": scores, **calculate_ia_total(scores), "answered": list(scores.keys())}
+
+
+@app.post("/api/exams/{exam_id}/textbook")
+async def upload_textbook(exam_id: str, file: UploadFile = File(...)):
+    eid = exam_id.strip().upper()
+    pdf_bytes = await file.read()
+    filename = file.filename or "textbook.pdf"
+    res = index_textbook_pdf(eid, pdf_bytes, filename)
+    update_exam_textbook(eid, filename)
+    return res
+
+
+@app.get("/api/exams/{exam_id}/results")
+def get_exam_results(exam_id: str):
+    eid = exam_id.strip().upper()
+    return {"results": get_student_results(eid)}
 
 
 if __name__ == "__main__":

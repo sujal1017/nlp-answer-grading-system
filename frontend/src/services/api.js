@@ -55,4 +55,15 @@ export const splitSubmission = (payload) =>
 export const evaluateStudent = (payload) =>
   api.post("/submissions/evaluate-student", payload);
 
+export const uploadTextbook = (examId, file) => {
+  const form = new FormData();
+  form.append("file", file);
+  return api.post(`/exams/${examId}/textbook`, form, {
+    headers: { "Content-Type": "multipart/form-data" },
+  });
+};
+
+export const getStudentResults = (examId) =>
+  api.get(`/exams/${examId}/results`);
+
 export default api;

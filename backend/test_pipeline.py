@@ -22,7 +22,11 @@ from database import (
     get_exam_rubrics,
     get_exam_submissions,
     get_kpi_counts,
+    get_student_results,
+    sync_student_result,
+    update_evaluation,
     update_rubric_weights_from_feedback,
+    verify_submission,
     save_student_answer,
     save_raw_booklet,
     get_raw_booklet,
@@ -994,6 +998,148 @@ def test_dump_q1a_split_char0_and_evaluate_workflow():
     print(f"  [ok] 3-step workflow: Dump Q1A -> Char 0 Reassign -> Split Q2B/Q3A/Q3B -> EduEval IA Total: {eval_data['ia_total']}/20")
 
 
+def test_anti_stuffing_guard_and_heading_parroting():
+    """Verify anti-stuffing guard: student who echoes rubric heading followed by random filler text scores 0.0 and points are marked Missing."""
+    question_text = "Discuss the important concepts associated with research design"
+    max_marks = 5.0
+    rubric_points = [
+        {"point": "Key factors, variables, and components involved", "weight": 1.25},
+        {"point": "Dependent and independent variables formulation", "weight": 1.25},
+        {"point": "Extraneous and confounding variables control", "weight": 1.25},
+        {"point": "Experimental vs control groups and hypotheses", "weight": 1.25},
+    ]
+
+    student_answer = (
+        "Key factors, variables, and components involved: Random unrelated sentences about weather and sports. "
+        "The quick brown fox jumps over the lazy dog in rainy autumn football tournaments."
+    )
+
+    res = evaluate_with_edueval(
+        question_text=question_text,
+        max_marks=max_marks,
+        key_points=rubric_points,
+        student_answer=student_answer,
+    )
+
+    assert res["ai_score"] == 0.0, f"Expected 0.0 for stuffed filler, got {res['ai_score']}"
+    assert "Key factors, variables, and components involved" in res["missing_points"], (
+        f"Expected rubric point to be Missing, got matched: {res['matched_points']}"
+    )
+    assert len(res["matched_points"]) == 0, f"Expected 0 matched points, got {res['matched_points']}"
+    print("  [ok] anti-stuffing guard (heading-echo filter & cross-encoder verification rejects parroted filler)")
+
+
+def test_textbook_rag_indexing_and_retrieval():
+    """Verify reference textbook PDF ingestion, chunking, embedding, npz persistence, and passage retrieval."""
+    import fitz
+    from rag import index_textbook_pdf, retrieve_textbook_context
+
+    eid = "TEST_EXAM_RAG_2026"
+    doc = fitz.open()
+
+    page1 = doc.new_page()
+    page1.insert_text(
+        (50, 72),
+        "Research Methodology Principles. Chapter 1: Fundamentals of Scientific Research.\n"
+        "Research design is a comprehensive master plan specifying the methods and procedures for collecting and analyzing data.\n"
+        "Key components include independent variables, dependent variables, and rigorous control of extraneous variables.",
+    )
+
+    page2 = doc.new_page()
+    page2.insert_text(
+        (50, 72),
+        "Chapter 2: Literature Review and Hypothesis Formulation.\n"
+        "A systematic literature review follows a rigorous five-stage protocol:\n"
+        "identifying source literature, screening relevant domain articles, critical content synthesis, identifying research gaps, and pilot documentation.",
+    )
+
+    pdf_bytes = doc.write()
+    doc.close()
+
+    try:
+        # 1. Test indexing
+        idx_res = index_textbook_pdf(eid, pdf_bytes, "Sample_Textbook.pdf")
+        assert idx_res["status"] == "indexed"
+        assert idx_res["pages"] == 2
+        assert idx_res["chunks"] >= 2
+
+        # 2. Test retrieval for research design
+        ctx_design = retrieve_textbook_context(eid, "What are the components of research design?", top_k=2)
+        assert len(ctx_design) > 0
+        assert any("independent variables" in c["text"].lower() for c in ctx_design)
+        assert ctx_design[0]["score"] > 0.0
+
+        # 3. Test retrieval for literature review
+        ctx_lit = retrieve_textbook_context(eid, "systematic literature review protocol", top_k=2)
+        assert len(ctx_lit) > 0
+        assert any("five-stage protocol" in c["text"].lower() for c in ctx_lit)
+        print("  [ok] textbook RAG engine: fitz extraction, chunking, MiniLM CPU embedding, npz storage & retrieval")
+    finally:
+        # Cleanup test npz file
+        from rag import get_index_path
+        npz_p = get_index_path(eid)
+        if npz_p.exists():
+            try:
+                npz_p.unlink()
+            except Exception:
+                pass
+
+
+def test_persistent_student_scorecard_sync():
+    """Verify persistent student_results table sync across AI evaluations and teacher overrides:
+    Q2A=4.5, Q2B=4.0, Q3A=5.0, Q3B=4.5 persists final_ia_total = 18.0 in student_results and updates to 18.5 on teacher override."""
+    init_db()
+    eid = "TEST_EXAM_SCORECARD_2026"
+    sid = "2SD23CS999"
+
+    # Clean existing
+    delete_all_student_submissions(eid, sid)
+
+    # Insert Q2A, Q2B, Q3A, Q3B submissions with AI scores
+    save_student_answer(eid, sid, "Q2A", ["p.png"], "Research classification.")
+    update_evaluation(eid, sid, "Q2A", ["point1"], [], 4.5, "Good answer.")
+
+    save_student_answer(eid, sid, "Q2B", ["p.png"], "Research design features.")
+    update_evaluation(eid, sid, "Q2B", ["point1"], [], 4.0, "Good answer.")
+
+    save_student_answer(eid, sid, "Q3A", ["p.png"], "Problem definition techniques.")
+    update_evaluation(eid, sid, "Q3A", ["point1"], [], 5.0, "Excellent answer.")
+
+    save_student_answer(eid, sid, "Q3B", ["p.png"], "Research design concepts.")
+    update_evaluation(eid, sid, "Q3B", ["point1"], [], 4.5, "Good answer.")
+
+    # 1. Sync student results
+    sc = sync_student_result(eid, sid)
+    assert sc["q2a_score"] == 4.5
+    assert sc["q2b_score"] == 4.0
+    assert sc["q2_total"] == 8.5
+    assert sc["q3a_score"] == 5.0
+    assert sc["q3b_score"] == 4.5
+    assert sc["q3_total"] == 9.5
+    assert sc["final_ia_total"] == 18.0, f"Expected 18.0, got {sc['final_ia_total']}"
+
+    # Verify persisted in database table
+    results = get_student_results(eid)
+    student_row = [r for r in results if r["student_id"] == sid][0]
+    assert student_row["final_ia_total"] == 18.0
+    assert student_row["status"] == "evaluated"
+
+    # 2. Teacher override on Q2B: changes from 4.0 to 4.5 (so q2_total becomes 9.0, final IA becomes 18.5)
+    verify_submission(eid, sid, "Q2B", 4.5, "Teacher override: thorough explanation.")
+    sc_updated = sync_student_result(eid, sid)
+    assert sc_updated["q2b_score"] == 4.5
+    assert sc_updated["q2_total"] == 9.0
+    assert sc_updated["final_ia_total"] == 18.5, f"Expected 18.5, got {sc_updated['final_ia_total']}"
+    assert sc_updated["verified_count"] >= 1
+
+    # Verify updated row in table
+    results_after = get_student_results(eid)
+    student_row_after = [r for r in results_after if r["student_id"] == sid][0]
+    assert student_row_after["final_ia_total"] == 18.5
+    assert student_row_after["q2b_score"] == 4.5
+    print("  [ok] persistent student_results sync: Q2(8.5)+Q3(9.5)=18.0 persists, teacher override Q2B=4.5 updates to 18.5")
+
+
 if __name__ == "__main__":
     print("Running EvalAI pipeline tests...")
     test_margin_normalization()
@@ -1019,4 +1165,7 @@ if __name__ == "__main__":
     test_database_and_calibration()
     test_transcribe_images_fallback_retry_recovers_page()
     test_edueval_deterministic_scoring_q1a()
+    test_anti_stuffing_guard_and_heading_parroting()
+    test_textbook_rag_indexing_and_retrieval()
+    test_persistent_student_scorecard_sync()
     print("\nAll EvalAI pipeline tests passed successfully!")

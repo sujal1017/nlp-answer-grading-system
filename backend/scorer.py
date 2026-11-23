@@ -9,13 +9,22 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 try:
-    from sentence_transformers import SentenceTransformer
+    from sentence_transformers import SentenceTransformer, CrossEncoder
     SENTENCE_TRANSFORMERS_AVAILABLE = True
+    CROSS_ENCODER_AVAILABLE = True
 except ImportError:
-    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    try:
+        from sentence_transformers import SentenceTransformer
+        SENTENCE_TRANSFORMERS_AVAILABLE = True
+        CROSS_ENCODER_AVAILABLE = False
+    except ImportError:
+        SENTENCE_TRANSFORMERS_AVAILABLE = False
+        CROSS_ENCODER_AVAILABLE = False
 
 _embedder = None
 _embedder_lock = threading.Lock()
+_cross_encoder = None
+_cross_encoder_lock = threading.Lock()
 
 STOPWORDS = {
     "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "aren't",
@@ -54,6 +63,79 @@ def get_embedder():
                     print(f"[!] Warning: Could not load SentenceTransformer embedder: {exc}")
                     _embedder = None
     return _embedder
+
+
+def get_cross_encoder():
+    """Lazy-load cross-encoder/ms-marco-MiniLM-L6-v2 on CPU as a singleton."""
+    global _cross_encoder
+    if _cross_encoder is None and CROSS_ENCODER_AVAILABLE:
+        with _cross_encoder_lock:
+            if _cross_encoder is None:
+                try:
+                    try:
+                        _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L6-v2", device="cpu", local_files_only=True)
+                    except Exception:
+                        _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L6-v2", device="cpu")
+                except Exception as exc:
+                    print(f"[!] Warning: Could not load CrossEncoder: {exc}")
+                    _cross_encoder = None
+    return _cross_encoder
+
+
+def _filter_echoed_headings(text: str, question_text: str, rubric_points: List[str]) -> str:
+    """
+    Strips echoed questions, rubric point headers, and heading prefixes from student answer
+    to prevent students from scoring points simply by copying the question or rubric points.
+    """
+    if not text:
+        return ""
+
+    lines = text.splitlines()
+    filtered_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        cleaned_line = stripped
+        # Check if line has a prefix before a colon/dash like "Rubric Title: answer text"
+        for delim in [":", " - ", "—", "–"]:
+            if delim in cleaned_line:
+                prefix, rest = cleaned_line.split(delim, 1)
+                prefix_clean = prefix.strip()
+                if len(prefix_clean) > 3:
+                    is_prefix_echo = False
+                    if fuzz.token_set_ratio(prefix_clean, question_text) >= 82:
+                        is_prefix_echo = True
+                    else:
+                        for pt in rubric_points:
+                            if fuzz.token_set_ratio(prefix_clean, pt) >= 82:
+                                is_prefix_echo = True
+                                break
+                    if is_prefix_echo:
+                        cleaned_line = rest.strip()
+                        break
+
+        if not cleaned_line:
+            continue
+
+        # Inspect short standalone lines (< 110 chars)
+        if len(cleaned_line) < 110:
+            is_echo = False
+            if fuzz.token_set_ratio(cleaned_line, question_text) >= 82:
+                is_echo = True
+            else:
+                for pt in rubric_points:
+                    if fuzz.token_set_ratio(cleaned_line, pt) >= 82:
+                        is_echo = True
+                        break
+            if is_echo:
+                continue
+
+        filtered_lines.append(cleaned_line)
+
+    return "\n".join(filtered_lines).strip()
 
 
 def clean_ocr_text(text: str) -> str:
@@ -125,12 +207,15 @@ def evaluate_with_edueval(
     key_points: List[Union[Dict, str]],
     student_answer: str,
     verified_examples: Optional[List[Dict]] = None,
+    exam_id: Optional[str] = None,
 ) -> Dict:
     """
-    EduEval Deterministic Hybrid Grader:
-      - 65% Semantic Cosine Similarity (all-MiniLM-L6-v2)
+    EduEval Deterministic Hybrid Grader with Anti-Stuffing & Textbook Grounding:
+      - Heading Echo Filter & Global Relevance Gate
+      - 65% Semantic Cosine Similarity (all-MiniLM-L6-v2) + Textbook grounding boost
       - 35% Fuzzy Keyword Recall (rapidfuzz token set / partial ratio)
-      - Zero GPU VRAM usage, instant deterministic evaluation.
+      - Cross-Encoder Entailment Verification (cross-encoder/ms-marco-MiniLM-L6-v2)
+      - Zero GPU VRAM usage, instant deterministic evaluation on CPU.
     """
     clean_text = clean_ocr_text(student_answer)
     default_w = round(float(max_marks) / max(len(key_points), 1), 2)
@@ -141,16 +226,35 @@ def evaluate_with_edueval(
         else:
             norm_points.append({"point": str(item), "weight": default_w})
 
-    if not clean_text or len(clean_text.strip()) < 10:
+    point_texts = [p["point"] for p in norm_points]
+
+    # 1. Heading Echo Filter
+    body_text = _filter_echoed_headings(clean_text, question_text, point_texts)
+
+    if not body_text or len(body_text.strip()) < 10:
         return {
             "matched_points": [],
-            "missing_points": [p["point"] for p in norm_points],
+            "missing_points": point_texts,
             "ai_score": 0.0,
-            "ai_feedback": "No student answer written or transcription is empty.",
+            "ai_feedback": "No scorable student answer written or answer only repeats question/headings.",
         }
 
     embedder = get_embedder()
-    candidate_chunks = _split_candidate_chunks(clean_text)
+
+    # 2. Global Question-Relevance Gate
+    relevance_scale = 1.0
+    if embedder is not None and body_text.strip():
+        try:
+            body_vec = embedder.encode([body_text], convert_to_numpy=True, normalize_embeddings=True)[0]
+            context_prompts = [question_text] + point_texts if question_text else point_texts
+            ctx_vecs = embedder.encode(context_prompts, convert_to_numpy=True, normalize_embeddings=True)
+            s_global = float(np.max(np.dot(ctx_vecs, body_vec)))
+            if s_global < 0.30:
+                relevance_scale = max(0.0, s_global / 0.30)
+        except Exception as g_exc:
+            relevance_scale = 1.0
+
+    candidate_chunks = _split_candidate_chunks(body_text)
 
     # Pre-embed candidate chunks if embedder is available
     chunk_embs = None
@@ -158,7 +262,6 @@ def evaluate_with_edueval(
     if embedder is not None and candidate_chunks:
         try:
             chunk_embs = embedder.encode(candidate_chunks, convert_to_numpy=True, normalize_embeddings=True)
-            point_texts = [p["point"] for p in norm_points]
             rubric_embs = embedder.encode(point_texts, convert_to_numpy=True, normalize_embeddings=True)
         except Exception as exc:
             print(f"[!] Warning: Embedder encoding failed: {exc}")
@@ -173,36 +276,82 @@ def evaluate_with_edueval(
         pt_text = item["point"]
         weight = float(item["weight"])
 
+        best_matching_student_window = body_text
+
         # a) Semantic score S_sem from cosine similarity
         if rubric_embs is not None and chunk_embs is not None:
             r_vec = rubric_embs[idx]
             sims = np.dot(chunk_embs, r_vec)
-            max_sim = float(np.max(sims))
+            best_chunk_idx = int(np.argmax(sims))
+            best_matching_student_window = candidate_chunks[best_chunk_idx]
+            max_sim = float(sims[best_chunk_idx])
             # Normalize cosine similarity from [0.25, 0.65] to [0.0, 1.0]
             s_sem = max(0.0, min(1.0, (max_sim - 0.25) / (0.65 - 0.25)))
         else:
             # Fallback when embeddings are unavailable
-            s_sem = compute_fuzzy_keyword_recall(pt_text, clean_text, threshold=70.0)
+            s_sem = compute_fuzzy_keyword_recall(pt_text, body_text, threshold=70.0)
+
+        # Textbook Reference Grounding Boost/Check
+        if exam_id:
+            try:
+                from rag import retrieve_textbook_context
+                book_chunks = retrieve_textbook_context(exam_id, f"{question_text} {pt_text}", top_k=2)
+                if book_chunks and embedder is not None:
+                    b_texts = " ".join([c["text"] for c in book_chunks if "text" in c])
+                    if b_texts.strip():
+                        b_emb = embedder.encode([b_texts], convert_to_numpy=True, normalize_embeddings=True)[0]
+                        win_emb = embedder.encode([best_matching_student_window], convert_to_numpy=True, normalize_embeddings=True)[0]
+                        sim_book = float(np.dot(win_emb, b_emb))
+                        s_book = max(0.0, min(1.0, (sim_book - 0.25) / (0.65 - 0.25)))
+                        s_sem = 0.75 * s_sem + 0.25 * s_book
+            except Exception:
+                pass
 
         # b) Fuzzy keyword score S_kw
-        s_kw = compute_fuzzy_keyword_recall(pt_text, clean_text, threshold=75.0)
+        s_kw = compute_fuzzy_keyword_recall(pt_text, body_text, threshold=75.0)
 
         # c) Combined match metric M_i
         m_i = 0.65 * s_sem + 0.35 * s_kw
 
-        # d) Classification
-        if m_i >= 0.48:
+        # Apply global relevance scale
+        m_i = m_i * relevance_scale
+
+        # d) Cross-Encoder Entailment Verification
+        is_matched = False
+        if m_i >= 0.35:
+            ce = get_cross_encoder()
+            if ce is not None:
+                try:
+                    pairs = [
+                        (f"{question_text}: {pt_text}", best_matching_student_window),
+                        (f"{question_text}: {pt_text}", body_text),
+                        (pt_text, best_matching_student_window),
+                        (pt_text, body_text),
+                    ]
+                    logits = ce.predict(pairs)
+                    max_logit = float(np.max(logits))
+                    # Calibrated sigmoid with MS-MARCO margin adjustment for answer snippets
+                    ce_score = 1.0 / (1.0 + np.exp(-(max_logit + 2.2)))
+                except Exception:
+                    ce_score = 1.0
+            else:
+                ce_score = 1.0
+
+            if ce_score >= 0.35:
+                is_matched = True
+
+        if is_matched:
             matched_points.append(pt_text)
-            if m_i >= 0.65:
+            if m_i >= 0.60:
                 awarded = weight
             else:
-                awarded = weight * min(1.0, m_i / 0.65)
+                awarded = weight * min(1.0, m_i / 0.60)
             raw_awarded_score += awarded
         else:
             missing_points.append(pt_text)
 
     # Length & Elaboration Bonus: Detailed multi-paragraph answer (>=120 words) with >=75% match
-    word_count = len(clean_text.split())
+    word_count = len(body_text.split())
     if word_count >= 120 and len(matched_points) >= max(1, int(0.75 * len(norm_points))):
         raw_awarded_score = max(raw_awarded_score, float(max_marks) * 0.9)
 

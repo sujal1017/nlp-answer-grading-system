@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { Plus, Trash2, Sparkles, Save, BookOpen, Scale, AlertCircle, CheckCircle } from "lucide-react";
-import { parseQuestions, updateRubric, upsertExam } from "../services/api";
+import { Plus, Trash2, Sparkles, Save, BookOpen, Scale, AlertCircle, CheckCircle, FileText, Upload } from "lucide-react";
+import { parseQuestions, updateRubric, upsertExam, uploadTextbook } from "../services/api";
 
 const SDMCET_SAMPLE_TEXT = `Q1 (a) Define research and explain its major objectives. 5 Marks CO-1
 Q1 (b) Describe the systematic procedure involved in reviewing the literature. 5 Marks CO-2
@@ -29,10 +29,16 @@ export default function QuestionStudio({ exam, onSaved }) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [textbookFile, setTextbookFile] = useState(null);
+  const [textbookStats, setTextbookStats] = useState(null);
+  const [textbookBusy, setTextbookBusy] = useState(false);
 
   useEffect(() => {
     if (exam?.exam_id) setExamId(exam.exam_id);
     if (exam?.exam_title) setTitle(exam.exam_title);
+    if (exam?.textbook_filename) {
+      setTextbookStats((prev) => prev || { filename: exam.textbook_filename, pages: "—", chunks: "—" });
+    }
     if (exam?.rubrics?.length) {
       setQuestions(
         exam.rubrics.map((r) => ({
@@ -44,6 +50,26 @@ export default function QuestionStudio({ exam, onSaved }) {
       );
     }
   }, [exam]);
+
+  const handleUploadTextbook = async () => {
+    if (!textbookFile) return;
+    setTextbookBusy(true);
+    setError("");
+    try {
+      const { data } = await uploadTextbook(examId, textbookFile);
+      setTextbookStats({
+        filename: textbookFile.name,
+        pages: data.pages || 0,
+        chunks: data.chunks || 0,
+      });
+      setMessage(`Successfully indexed textbook: ${textbookFile.name} (${data.pages} pages, ${data.chunks} chunks).`);
+      onSaved?.(examId);
+    } catch (err) {
+      setError(err.response?.data?.detail || err.message || "Failed to index textbook.");
+    } finally {
+      setTextbookBusy(false);
+    }
+  };
 
   const updateQ = (idx, patch) => {
     setQuestions((prev) => prev.map((q, i) => (i === idx ? { ...q, ...patch } : q)));
@@ -239,6 +265,49 @@ export default function QuestionStudio({ exam, onSaved }) {
             {error}
           </p>
         )}
+
+        {/* Reference Textbook / Notes Upload Card */}
+        <div className="mt-5 pt-4 border-t border-slate-200">
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="flex items-center gap-1.5">
+              <FileText className="w-4 h-4 text-indigo-600" />
+              <h4 className="text-sm font-bold text-slate-900">Reference Textbook / Notes (PDF)</h4>
+            </div>
+            <span className="text-[10px] font-semibold uppercase tracking-wider text-indigo-700 bg-indigo-50 border border-indigo-200 px-2 py-0.5 rounded-full">
+              RAG Grounding (CPU)
+            </span>
+          </div>
+          <p className="text-xs text-slate-500 mb-3">
+            Upload prescribed textbook or lecture notes PDF to ground rubric generation and answer scoring.
+          </p>
+
+          {textbookStats && (
+            <div className="mb-3 flex items-center gap-2 text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg p-2.5">
+              <CheckCircle className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+              <span>
+                Indexed: <strong className="font-bold">{textbookStats.filename}</strong> ({textbookStats.pages} pages, {textbookStats.chunks} chunks)
+              </span>
+            </div>
+          )}
+
+          <div className="flex items-center gap-2">
+            <input
+              type="file"
+              accept="application/pdf"
+              onChange={(e) => setTextbookFile(e.target.files?.[0] || null)}
+              className="text-xs text-slate-600 file:mr-2 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-semibold file:bg-slate-100 file:text-slate-700 hover:file:bg-slate-200 cursor-pointer flex-1"
+            />
+            <button
+              type="button"
+              onClick={handleUploadTextbook}
+              disabled={textbookBusy || !textbookFile}
+              className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-indigo-600 text-white font-semibold px-3 py-1.5 text-xs hover:bg-indigo-700 disabled:opacity-50 transition-colors shadow-sm"
+            >
+              <Upload className="w-3.5 h-3.5" />
+              {textbookBusy ? "Indexing..." : "Upload & Index"}
+            </button>
+          </div>
+        </div>
       </section>
 
       {/* RIGHT: Rubric Review and Fine-Tuning */}

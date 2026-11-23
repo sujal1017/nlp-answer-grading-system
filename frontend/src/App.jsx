@@ -1,15 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
-import { BadgeCheck, Cpu, FileText, ScanLine, Zap, RefreshCw } from "lucide-react";
+import { BadgeCheck, Cpu, FileText, ScanLine, Zap, RefreshCw, FileSpreadsheet } from "lucide-react";
 import BatchGrading from "./components/BatchGrading.jsx";
 import KpiCards from "./components/KpiCards.jsx";
 import QuestionStudio from "./components/QuestionStudio.jsx";
 import ReviewGrade from "./components/ReviewGrade.jsx";
+import ResultsLedger from "./components/ResultsLedger.jsx";
 import { getExam, getExams, getTelemetry, unloadEngine } from "./services/api";
 
 const TABS = [
   { id: "studio", label: "01. Question Studio", icon: FileText },
   { id: "grade", label: "02. Batch Grading", icon: ScanLine },
   { id: "review", label: "03. Review & Calibrate", icon: BadgeCheck },
+  { id: "ledger", label: "04. Marks Ledger", icon: FileSpreadsheet },
 ];
 
 export default function App() {
@@ -20,6 +22,7 @@ export default function App() {
   const [telemetry, setTelemetry] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [flushing, setFlushing] = useState(false);
+  const [selectedStudent, setSelectedStudent] = useState("");
 
   const reload = useCallback(async (preferredId) => {
     try {
@@ -189,6 +192,17 @@ export default function App() {
             examId={examId}
             refreshKey={refreshKey}
             onCalibrated={bump}
+            initialStudentId={selectedStudent}
+            onGoToLedger={() => setTab("ledger")}
+          />
+        )}
+        {tab === "ledger" && (
+          <ResultsLedger
+            examId={examId}
+            onSelectStudent={(sid) => {
+              setSelectedStudent(sid);
+              setTab("review");
+            }}
           />
         )}
       </div>
