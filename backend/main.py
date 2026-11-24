@@ -1,8 +1,7 @@
-import os
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from chunker import (
     calculate_ia_total,
+    chunk_student_booklet,
     convert_pdf_to_images,
     parse_teacher_questions,
 )
@@ -29,7 +29,6 @@ from database import (
     get_exam_submissions,
     get_kpi_counts,
     get_raw_booklet,
-    get_verified_examples,
     init_db,
     merge_and_reassign_submissions,
     save_question_rubric,
@@ -38,7 +37,6 @@ from database import (
     split_at_cursor,
     split_submission,
     update_evaluation,
-    update_bert_evaluation,
     update_rubric_weights_from_feedback,
     verify_submission,
 )
@@ -75,8 +73,9 @@ ROOT_TEST_DIR = BACKEND_DIR.parent / "test"
 class QuestionIn(BaseModel):
     question_id: str
     question_text: str
-    max_marks: int = 5
+    max_marks: int = Field(default=5, gt=0)
     key_points: Optional[List[Any]] = None
+    reference_answer: str = ""
 
 
 class ExamIn(BaseModel):
@@ -93,8 +92,9 @@ class ParseIn(BaseModel):
 
 class RubricUpdate(BaseModel):
     question_text: str
-    max_marks: int
+    max_marks: int = Field(gt=0)
     key_points: List[Any]
+    reference_answer: str = ""
 
 
 class VerifyIn(BaseModel):
@@ -131,7 +131,6 @@ class EvaluateStudentRequest(BaseModel):
     exam_id: str
     student_id: str
     question_id: Optional[str] = None
-    scoring_model: Literal["edueval", "bert"] = "edueval"
 
 
 class AssignSegmentRequest(BaseModel):
@@ -164,6 +163,136 @@ def public_file_url(path: str) -> str:
             pass
     norm = p.as_posix().lstrip("/\\")
     return "/files/" + norm
+
+
+async def _store_uploads(exam_id: str, student_id: str, files: List[UploadFile]) -> List[str]:
+    student_dir = DATA_DIR / "booklets" / exam_id / student_id
+    student_dir.mkdir(parents=True, exist_ok=True)
+    page_paths = []
+    for file_index, upload in enumerate(files, start=1):
+        suffix = Path(upload.filename or "").suffix.lower()
+        if suffix not in {".pdf", ".png", ".jpg", ".jpeg"}:
+            raise HTTPException(400, f"Unsupported file type: {suffix or 'unknown'}")
+        raw = await upload.read()
+        if not raw:
+            raise HTTPException(400, f"Uploaded file is empty: {upload.filename or file_index}")
+
+        upload_dir = student_dir / f"upload_{file_index:03d}"
+        if suffix == ".pdf":
+            page_paths.extend(convert_pdf_to_images(raw, str(upload_dir)))
+        else:
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            image_path = upload_dir / f"page_001{suffix}"
+            image_path.write_bytes(raw)
+            page_paths.append(str(image_path))
+
+    if not page_paths:
+        raise HTTPException(400, "No pages were found in the uploaded files.")
+    return page_paths
+
+
+def _relative_page_paths(page_paths: List[str]) -> List[str]:
+    relative_paths = []
+    for page_path in page_paths:
+        try:
+            relative_paths.append(
+                Path(page_path).resolve().relative_to(DATA_DIR.resolve()).as_posix()
+            )
+        except ValueError:
+            relative_paths.append(page_path)
+    return relative_paths
+
+
+def _transcribe_and_grade(
+    exam_id: str,
+    student_id: str,
+    page_paths: List[str],
+    progress_cb=None,
+) -> Dict[str, Any]:
+    def report(message: str):
+        if progress_cb:
+            progress_cb(message)
+
+    report("OCR: starting TrOCR handwriting recognition")
+    transcript = engine.transcribe_images(page_paths, progress_cb=progress_cb, auto_unload=True)
+    relative_paths = _relative_page_paths(page_paths)
+    save_raw_booklet(exam_id, student_id, relative_paths, transcript)
+
+    if not transcript.strip():
+        delete_all_student_submissions(exam_id, student_id)
+        return {
+            "transcript": transcript,
+            "submissions": [],
+            "chunks": [],
+            "ia": calculate_ia_total({}),
+            "needs_review": True,
+            "message": "OCR found no readable text. Check the uploaded pages and handwriting.",
+        }
+
+    rubrics = get_exam_rubrics(exam_id)
+    rubric_map = {rubric["question_id"].upper(): rubric for rubric in rubrics}
+    chunks = chunk_student_booklet(transcript, rubrics)
+    grade_inputs = [
+        (question_id.upper(), answer.strip())
+        for question_id, answer in chunks.items()
+        if question_id.upper() in rubric_map and answer.strip()
+    ]
+
+    if not grade_inputs:
+        delete_all_student_submissions(exam_id, student_id)
+        return {
+            "transcript": transcript,
+            "submissions": [],
+            "chunks": [],
+            "ia": calculate_ia_total({}),
+            "needs_review": True,
+            "message": "OCR is complete, but no question sections matched the exam rubrics. Review and assign the extracted text.",
+        }
+
+    evaluated = []
+    try:
+        for index, (question_id, answer) in enumerate(grade_inputs, start=1):
+            rubric = rubric_map[question_id]
+            report(f"BERT: grading {question_id} ({index}/{len(grade_inputs)})")
+            result = engine.evaluate_answer(
+                question_text=rubric["question_text"],
+                max_marks=rubric["max_marks"],
+                key_points=rubric["key_points"],
+                student_answer=answer,
+                reference_answer=rubric.get("reference_answer", ""),
+            )
+            evaluated.append((question_id, answer, result))
+
+        delete_all_student_submissions(exam_id, student_id)
+        scores = {}
+        for question_id, answer, result in evaluated:
+            save_student_answer(exam_id, student_id, question_id, relative_paths, answer)
+            update_evaluation(
+                exam_id=exam_id,
+                student_id=student_id,
+                question_id=question_id,
+                matched_points=result["matched_points"],
+                missing_points=result["missing_points"],
+                ai_score=result["ai_score"],
+                ai_feedback=result["ai_feedback"],
+                similarity_score=result["similarity_score"],
+                keyword_coverage=result["keyword_coverage"],
+            )
+            scores[question_id] = result["ai_score"]
+    finally:
+        engine.unload_model()
+
+    submissions = get_exam_submissions(exam_id, student_id)
+    for submission in submissions:
+        submission["max_marks"] = rubric_map[submission["question_id"].upper()]["max_marks"]
+    return {
+        "transcript": transcript,
+        "submissions": submissions,
+        "chunks": [question_id for question_id, _, _ in evaluated],
+        "ia": calculate_ia_total(scores),
+        "needs_review": False,
+        "message": "TrOCR extraction and BERT grading complete.",
+    }
 
 
 @app.get("/api/health")
@@ -214,8 +343,21 @@ def upsert_exam(payload: ExamIn):
     for q in payload.questions:
         qid = q.question_id.strip().upper().replace(" ", "")
         points = q.key_points or generate_atomic_rubric(q.question_text, q.max_marks)
-        save_question_rubric(exam_id, qid, q.question_text.strip(), int(q.max_marks), points)
-        saved.append({"question_id": qid, "question_text": q.question_text, "max_marks": q.max_marks, "key_points": points})
+        save_question_rubric(
+            exam_id,
+            qid,
+            q.question_text.strip(),
+            int(q.max_marks),
+            points,
+            q.reference_answer,
+        )
+        saved.append({
+            "question_id": qid,
+            "question_text": q.question_text,
+            "max_marks": q.max_marks,
+            "key_points": points,
+            "reference_answer": q.reference_answer,
+        })
     return {"exam_id": exam_id, "questions": saved}
 
 
@@ -236,7 +378,14 @@ def exam_rubrics(exam_id: str):
 
 @app.put("/api/exams/{exam_id}/rubrics/{question_id}")
 def update_rubric(exam_id: str, question_id: str, payload: RubricUpdate):
-    save_question_rubric(exam_id, question_id, payload.question_text, payload.max_marks, payload.key_points)
+    save_question_rubric(
+        exam_id,
+        question_id,
+        payload.question_text,
+        payload.max_marks,
+        payload.key_points,
+        payload.reference_answer,
+    )
     return {"ok": True}
 
 
@@ -298,47 +447,18 @@ async def upload_booklet(
     if not files:
         raise HTTPException(400, "Upload at least one booklet PDF or image")
 
-    student_dir = DATA_DIR / "booklets" / eid / sid
-    student_dir.mkdir(parents=True, exist_ok=True)
-    page_paths = []
-    img_idx = 0
-    for upload in files:
-        raw = await upload.read()
-        name = (upload.filename or "page.bin").lower()
-        if name.endswith(".pdf"):
-            page_paths.extend(convert_pdf_to_images(raw, str(student_dir)))
-        else:
-            img_idx += 1
-            ext = Path(name).suffix or ".png"
-            dest = student_dir / f"page_{img_idx}{ext}"
-            dest.write_bytes(raw)
-            page_paths.append(str(dest))
-
-    # Step 1: Run Qwen2-VL verbatim OCR across all pages (no automatic chunking)
-    full_booklet_text = engine.transcribe_images(page_paths, auto_unload=True)
-
-    relative_paths = []
-    for p in page_paths:
-        try:
-            rel = Path(p).resolve().relative_to(DATA_DIR.resolve()).as_posix()
-            relative_paths.append(rel)
-        except Exception:
-            relative_paths.append(p)
-
-    # Delete any previous submissions so re-upload starts fresh
-    delete_all_student_submissions(eid, sid)
-    # Save entire OCR text directly into Q1A
-    save_student_answer(eid, sid, "Q1A", relative_paths, full_booklet_text)
-    save_raw_booklet(eid, sid, relative_paths, full_booklet_text)
-    engine.unload_model()
-
+    page_paths = await _store_uploads(eid, sid, files)
+    result = _transcribe_and_grade(eid, sid, page_paths)
     return {
-        "status": "transcribed",
+        "status": "needs_review" if result["needs_review"] else "evaluated",
         "student_id": sid,
-        "question_id": "Q1A",
         "pages": len(page_paths),
-        "text": full_booklet_text,
-        "image_urls": [public_file_url(p) for p in relative_paths],
+        "text": result["transcript"],
+        "submissions": result["submissions"],
+        "chunks": result["chunks"],
+        "ia": result["ia"],
+        "message": result["message"],
+        "image_urls": [public_file_url(p) for p in _relative_page_paths(page_paths)],
     }
 
 
@@ -402,8 +522,7 @@ def split_submission_endpoint(payload: SplitRequest):
 @app.post("/api/submissions/evaluate-student")
 def evaluate_student_endpoint(payload: EvaluateStudentRequest):
     """
-    Step 3: Evaluate assigned answers using EduEval or BERT MNLI.
-    The default preserves EduEval behavior; BERT scores are stored separately.
+    Grade one or all assigned question answers using the BERT rubric grader.
     """
     eid = payload.exam_id.strip().upper()
     sid = payload.student_id.strip().upper()
@@ -417,33 +536,18 @@ def evaluate_student_endpoint(payload: EvaluateStudentRequest):
     else:
         subs_to_eval = subs
 
-    for s in subs_to_eval:
-        q_id = s["question_id"].upper()
-        ans_text = s.get("transcribed_text") or ""
-        if q_id in rubric_map:
-            r_info = rubric_map[q_id]
-            if payload.scoring_model == "bert":
-                eval_res = engine.evaluate_answer_bert(
-                    question_text=r_info["question_text"],
-                    max_marks=r_info["max_marks"],
-                    key_points=r_info["key_points"],
-                    student_answer=ans_text,
-                )
-                update_bert_evaluation(
-                    exam_id=eid,
-                    student_id=sid,
-                    question_id=q_id,
-                    bert_score=eval_res["ai_score"],
-                    bert_feedback=eval_res["ai_feedback"],
-                )
-            else:
-                past = get_verified_examples(eid, q_id, limit=2)
+    try:
+        for s in subs_to_eval:
+            q_id = s["question_id"].upper()
+            ans_text = s.get("transcribed_text") or ""
+            if q_id in rubric_map:
+                r_info = rubric_map[q_id]
                 eval_res = engine.evaluate_answer(
                     question_text=r_info["question_text"],
                     max_marks=r_info["max_marks"],
                     key_points=r_info["key_points"],
                     student_answer=ans_text,
-                    verified_examples=past,
+                    reference_answer=r_info.get("reference_answer", ""),
                 )
                 update_evaluation(
                     exam_id=eid,
@@ -453,15 +557,16 @@ def evaluate_student_endpoint(payload: EvaluateStudentRequest):
                     missing_points=eval_res["missing_points"],
                     ai_score=eval_res["ai_score"],
                     ai_feedback=eval_res["ai_feedback"],
+                    similarity_score=eval_res["similarity_score"],
+                    keyword_coverage=eval_res["keyword_coverage"],
                 )
+    finally:
+        engine.unload_model()
 
     updated_subs = get_exam_submissions(eid, sid)
     for row in updated_subs:
         row["image_urls"] = [public_file_url(p) for p in row.get("image_paths", [])]
-    if payload.scoring_model == "bert":
-        scores = {r["question_id"]: float(r["bert_score"] or 0.0) for r in updated_subs}
-    else:
-        scores = {r["question_id"]: float(r["teacher_score"] or r["ai_score"] or 0.0) for r in updated_subs}
+    scores = {r["question_id"]: float(r["teacher_score"] or r["ai_score"] or 0.0) for r in updated_subs}
     ia_breakdown = calculate_ia_total(scores)
 
     return {
@@ -562,33 +667,18 @@ def _run_grade_job(job_id: str, exam_id: str, student_id: str, page_paths: List[
     job = jobs[job_id]
     try:
         with grade_lock:
-            def progress(msg: str):
+            def progress(msg: str) -> None:
                 job["progress"] = msg
 
             job["status"] = "running"
-            job["progress"] = "Starting booklet digitization with Qwen2-VL"
-            full_md = engine.transcribe_images(page_paths, progress_cb=progress, auto_unload=True)
-            job["transcript"] = full_md
-
-            relative_paths = []
-            for p in page_paths:
-                try:
-                    rel = Path(p).resolve().relative_to(DATA_DIR.resolve()).as_posix()
-                    relative_paths.append(rel)
-                except Exception:
-                    relative_paths.append(p)
-
-            # Reset previous submissions so re-grading starts fresh with all text dumped into Q1A
-            delete_all_student_submissions(exam_id, student_id)
-            save_student_answer(exam_id, student_id, "Q1A", relative_paths, full_md)
-            save_raw_booklet(exam_id, student_id, relative_paths, full_md)
-            engine.unload_model()
-
-            job["chunks"] = ["Q1A"]
-            job["results"] = [{"question_id": "Q1A", "status": "Transcribed", "ai_score": 0.0}]
-            job["ia"] = calculate_ia_total({"Q1A": 0.0})
+            result = _transcribe_and_grade(exam_id, student_id, page_paths, progress)
+            job["transcript"] = result["transcript"]
+            job["chunks"] = result["chunks"]
+            job["results"] = result["submissions"]
+            job["ia"] = result["ia"]
+            job["needs_review"] = result["needs_review"]
             job["status"] = "done"
-            job["progress"] = "OCR complete: Full booklet transcribed into Q1A (ready for teacher cursor split)"
+            job["progress"] = result["message"]
     except Exception as exc:
         job["status"] = "error"
         job["error"] = str(exc)
@@ -611,21 +701,7 @@ async def grade_booklet(
     if not files:
         raise HTTPException(400, "Upload a booklet PDF or page images")
 
-    student_dir = DATA_DIR / "booklets" / exam_id.upper() / usn
-    student_dir.mkdir(parents=True, exist_ok=True)
-    page_paths: List[str] = []
-    img_idx = 0
-    for upload in files:
-        raw = await upload.read()
-        name = (upload.filename or "page.bin").lower()
-        if name.endswith(".pdf"):
-            page_paths.extend(convert_pdf_to_images(raw, str(student_dir)))
-        else:
-            img_idx += 1
-            ext = Path(name).suffix or ".png"
-            dest = student_dir / f"page_{img_idx}{ext}"
-            dest.write_bytes(raw)
-            page_paths.append(str(dest))
+    page_paths = await _store_uploads(exam_id.strip().upper(), usn, files)
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
@@ -635,6 +711,9 @@ async def grade_booklet(
         "exam_id": exam_id.upper(),
         "student_id": usn,
         "pages": len(page_paths),
+        "transcript": "",
+        "chunks": [],
+        "results": [],
     }
     background_tasks.add_task(_run_grade_job, job_id, exam_id.upper(), usn, page_paths)
     return {"job_id": job_id, "pages": len(page_paths)}
@@ -654,11 +733,9 @@ def grade_sample_booklet(
     if not pdf_path.exists():
         raise HTTPException(404, f"Sample file '{payload.sample_name}' not found on server")
 
-    student_dir = DATA_DIR / "booklets" / exam_id.upper() / usn
-    student_dir.mkdir(parents=True, exist_ok=True)
-
     raw_pdf = pdf_path.read_bytes()
-    page_paths = convert_pdf_to_images(raw_pdf, str(student_dir))
+    sample_dir = DATA_DIR / "booklets" / exam_id.upper() / usn / "sample"
+    page_paths = convert_pdf_to_images(raw_pdf, str(sample_dir))
     if payload.max_pages and payload.max_pages > 0:
         page_paths = page_paths[:payload.max_pages]
 
@@ -670,6 +747,9 @@ def grade_sample_booklet(
         "exam_id": exam_id.upper(),
         "student_id": usn,
         "pages": len(page_paths),
+        "transcript": "",
+        "chunks": [],
+        "results": [],
     }
     background_tasks.add_task(_run_grade_job, job_id, exam_id.upper(), usn, page_paths)
     return {"job_id": job_id, "pages": len(page_paths)}

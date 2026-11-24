@@ -5,10 +5,7 @@ pymupdf
 torch
 torchvision
 transformers
-accelerate
-qwen-vl-utils
 Pillow
-sentence-transformers
+opencv-python-headless
 rapidfuzz
-scikit-learn
 numpy

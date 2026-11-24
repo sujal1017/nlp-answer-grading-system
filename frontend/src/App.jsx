@@ -49,6 +49,7 @@ export default function App() {
     getExam(examId)
       .then(({ data }) => setExam({ ...data.exam, rubrics: data.rubrics, kpis: data.kpis }))
       .catch(() => setExam(null));
+    getTelemetry().then(({ data }) => setTelemetry(data)).catch(() => {});
   }, [examId, refreshKey]);
 
   const bump = () => setRefreshKey((n) => n + 1);
@@ -76,7 +77,7 @@ export default function App() {
               </span>
             </div>
             <p className="text-xs text-slate-300 mt-1">
-              Offline Qwen2-VL Digitization · Teacher Question Studio · Hybrid Semantic Boundary Chunker · SDMCET Choice Rules
+              TrOCR Handwriting OCR · BERT Rubric Grading · Teacher Question Studio · SDMCET Choice Rules
             </p>
           </div>
 
@@ -96,7 +97,9 @@ export default function App() {
 
             <span className="inline-flex items-center gap-2 rounded-full border border-emerald-400/40 bg-emerald-400/10 text-emerald-300 text-xs font-semibold px-3 py-1.5 shadow-sm">
               <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-              {telemetry?.cuda_available ? "CUDA Accelerated" : "CPU Fallback"} · {telemetry?.device_name || "RTX 4050"}
+              {telemetry?.cuda_available
+                ? `CUDA available · ${telemetry.device_name}`
+                : "CPU execution"}
             </span>
           </div>
         </header>
@@ -111,18 +114,14 @@ export default function App() {
             <span className="text-slate-300">|</span>
             <div className="flex items-center gap-1.5">
               <Cpu className="w-3.5 h-3.5 text-slate-500" />
-              <span className="font-mono">{telemetry?.model || "Qwen2-VL-2B-Instruct"}</span>
+              <span className="font-mono">TrOCR: {telemetry?.ocr_status || "Ready on first use"}</span>
             </div>
             <span className="text-slate-300">|</span>
-            <span>Target: <b>{telemetry?.target_device || "NVIDIA RTX 4050 (6GB)"}</b></span>
+            <span className="font-mono">BERT: {telemetry?.grader_status || "Ready on first use"}</span>
             <span className="text-slate-300">|</span>
-            {telemetry?.model_loaded ? (
-              <span className="text-emerald-700 font-semibold bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">
-                Active in VRAM ({telemetry.vram_allocated_gb} GB)
-              </span>
-            ) : (
-              <span className="text-slate-400">VRAM Released (Ready on demand)</span>
-            )}
+            <span className="text-slate-500">
+              {telemetry?.ocr_model || "microsoft/trocr-base-handwritten"} · {telemetry?.grader_model || "BERT"}
+            </span>
           </div>
 
           <button
@@ -132,7 +131,7 @@ export default function App() {
             className="inline-flex items-center gap-1.5 text-xs font-semibold rounded-lg border border-slate-300 bg-slate-50 hover:bg-slate-100 px-3 py-1.5 text-slate-700 transition-colors"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${flushing ? "animate-spin" : ""}`} />
-            Flush GPU VRAM Cache
+            Release Model Memory
           </button>
         </div>
 
@@ -187,6 +186,7 @@ export default function App() {
         {tab === "review" && (
           <ReviewGrade
             examId={examId}
+            rubrics={exam?.rubrics || []}
             refreshKey={refreshKey}
             onCalibrated={bump}
           />

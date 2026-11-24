@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Rocket, Upload, FileText, CheckCircle2, AlertTriangle, ArrowRight, Layers } from "lucide-react";
+import { Rocket, Upload, CheckCircle2, AlertTriangle, ArrowRight, Layers } from "lucide-react";
 import { getJob, getSampleBooklets, gradeBooklet, gradeSampleBooklet } from "../services/api";
 
 export default function BatchGrading({ examId, onFinished, onGoToReview }) {
@@ -61,7 +61,7 @@ export default function BatchGrading({ examId, onFinished, onGoToReview }) {
           max_pages: maxPages > 0 ? maxPages : null,
         });
         jobId = data.job_id;
-        setProgress(`Queued ${data.pages} booklet pages for VLM inference`);
+        setProgress(`Queued ${data.pages} pages for TrOCR and BERT`);
       } else {
         if (!files.length) {
           throw new Error("Select at least one PDF or image file.");
@@ -88,11 +88,11 @@ export default function BatchGrading({ examId, onFinished, onGoToReview }) {
         <div>
           <h3 className="text-lg font-bold text-slate-900">Batch Student Booklet Digitization &amp; Grading</h3>
           <p className="text-sm text-slate-500 mt-0.5">
-            Target Exam: <span className="font-mono font-bold text-indigo-700">{examId || "—"}</span>. Runs locally with CUDA acceleration on NVIDIA RTX 4050.
+            Target Exam: <span className="font-mono font-bold text-indigo-700">{examId || "—"}</span>. OCR and BERT run locally on CUDA when available, otherwise CPU.
           </p>
         </div>
         <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
-          Qwen2-VL-2B (CUDA)
+          TrOCR OCR · BERT grading
         </span>
       </div>
 
@@ -207,7 +207,7 @@ export default function BatchGrading({ examId, onFinished, onGoToReview }) {
           className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 text-sm disabled:opacity-50 transition-all shadow-md"
         >
           <Rocket className="w-4 h-4" />
-          {busy ? progress || "Processing Booklet with Qwen2-VL..." : "Run Multi-Page OCR & Automated Evaluation"}
+          {busy ? progress || "Processing with TrOCR and BERT..." : "Run TrOCR OCR & BERT Grading"}
         </button>
 
         {/* Live Progress Banner */}
@@ -218,7 +218,7 @@ export default function BatchGrading({ examId, onFinished, onGoToReview }) {
               <p className="text-sm font-semibold text-indigo-900">{progress}</p>
             </div>
             <p className="text-xs text-indigo-700 mt-1 ml-7">
-              Executing temperature=0.0 greedy decoding on RTX 4050 with negative prompt filters to eliminate hallucinations.
+              OCR and grading status is reported separately. Models load on first use and are released after grading.
             </p>
           </div>
         )}
@@ -236,20 +236,58 @@ export default function BatchGrading({ examId, onFinished, onGoToReview }) {
 
         {/* Evaluation Result Summary */}
         {result?.status === "done" && (
-          <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-5 space-y-3">
+          <div className={`rounded-xl border p-5 space-y-3 ${
+            result.needs_review ? "border-amber-200 bg-amber-50" : "border-emerald-200 bg-emerald-50"
+          }`}>
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <CheckCircle2 className="w-5 h-5 text-emerald-600" />
-                <p className="font-bold text-emerald-950">Evaluation Complete for {result.student_id}</p>
+                {result.needs_review ? (
+                  <AlertTriangle className="w-5 h-5 text-amber-600" />
+                ) : (
+                  <CheckCircle2 className="w-5 h-5 text-emerald-600" />
+                )}
+                <p className="font-bold text-slate-950">
+                  {result.needs_review ? "OCR needs review" : `BERT grading complete for ${result.student_id}`}
+                </p>
               </div>
-              <span className="text-xs font-semibold bg-emerald-100 text-emerald-800 px-3 py-1 rounded-full">
+              <span className="text-xs font-semibold bg-white/70 text-slate-800 px-3 py-1 rounded-full">
                 {result.chunks?.length || 0} Questions Segmented
               </span>
             </div>
 
-            <p className="text-sm text-emerald-900">
-              Extracted student answers: <span className="font-mono font-bold">{(result.chunks || []).join(", ")}</span>
-            </p>
+            <p className="text-sm text-slate-800">{result.progress}</p>
+            {result.message && <p className="text-sm text-slate-700">{result.message}</p>}
+
+            {result.transcript && (
+              <details className="rounded-lg border border-slate-200 bg-white p-3" open>
+                <summary className="cursor-pointer text-sm font-semibold text-slate-800">
+                  Extracted OCR text
+                </summary>
+                <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap text-xs leading-relaxed text-slate-700">
+                  {result.transcript}
+                </pre>
+              </details>
+            )}
+
+            {!!result.results?.length && (
+              <div className="space-y-2">
+                {result.results.map((submission) => (
+                  <article key={submission.question_id} className="rounded-lg border border-slate-200 bg-white p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                      <b>{submission.question_id}</b>
+                      <span>
+                        BERT marks: <b>{submission.ai_score ?? 0} / {submission.max_marks ?? "—"}</b>
+                      </span>
+                      <span>Similarity: {Math.round((submission.similarity_score ?? 0) * 100)}%</span>
+                      <span>Keyword coverage: {Math.round((submission.keyword_coverage ?? 0) * 100)}%</span>
+                    </div>
+                    {submission.ai_feedback && (
+                      <p className="mt-2 text-xs text-slate-600">{submission.ai_feedback}</p>
+                    )}
+                  </article>
+                ))}
+              </div>
+            )}
 
             {result.ia && (
               <div className="bg-white border border-emerald-200 rounded-lg p-3 grid grid-cols-2 sm:grid-cols-4 gap-2 text-center text-xs">

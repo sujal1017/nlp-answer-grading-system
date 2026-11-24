@@ -13,6 +13,7 @@ const emptyQuestion = (id = "Q1A") => ({
   question_id: id,
   question_text: "",
   max_marks: 5,
+  reference_answer: "",
   key_points: [
     { point: "Core conceptual definition and explanation", weight: 1.25 },
     { point: "Key characteristics and distinguishing components", weight: 1.25 },
@@ -40,6 +41,7 @@ export default function QuestionStudio({ exam, onSaved }) {
           question_text: r.question_text,
           max_marks: r.max_marks,
           key_points: r.key_points || [],
+          reference_answer: r.reference_answer || "",
         }))
       );
     }
@@ -58,7 +60,7 @@ export default function QuestionStudio({ exam, onSaved }) {
       if (!data.questions?.length) {
         setError("Could not parse questions. Use Q1 (a) ... 5 Marks, or Q1A | prompt | 5.");
       } else {
-        setQuestions(data.questions);
+        setQuestions(data.questions.map((question) => ({ ...question, reference_answer: "" })));
         setMessage(`Parsed ${data.questions.length} questions and generated atomic rubrics with calibrated weights.`);
       }
     } catch (e) {
@@ -108,6 +110,7 @@ export default function QuestionStudio({ exam, onSaved }) {
         question_text: q.question_text,
         max_marks: q.max_marks,
         key_points: q.key_points,
+        reference_answer: q.reference_answer || "",
       });
       setMessage(`Updated question ${q.question_id} rubric.`);
       onSaved?.(examId);
@@ -248,7 +251,7 @@ export default function QuestionStudio({ exam, onSaved }) {
             Atomic Rubrics &amp; Calibrated Weights ({questions.length})
           </h3>
           <span className="text-xs text-slate-500 font-medium">
-            Weights auto-balance to match Max Marks
+            BERT uses the reference answer and weighted rubric criteria
           </span>
         </div>
 
@@ -330,6 +333,18 @@ export default function QuestionStudio({ exam, onSaved }) {
                   className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm min-h-[60px]"
                   value={q.question_text}
                   onChange={(e) => updateQ(idx, { question_text: e.target.value })}
+                />
+              </div>
+
+              <div className="mt-3">
+                <label className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                  Teacher Reference Answer (optional)
+                </label>
+                <textarea
+                  className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm min-h-[80px]"
+                  value={q.reference_answer || ""}
+                  onChange={(e) => updateQ(idx, { reference_answer: e.target.value })}
+                  placeholder="Add an ideal answer to improve BERT semantic comparison."
                 />
               </div>
 

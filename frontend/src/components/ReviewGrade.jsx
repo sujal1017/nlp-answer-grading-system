@@ -38,7 +38,7 @@ function defaultTargetFor(qid) {
   return "Q1A";
 }
 
-export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
+export default function ReviewGrade({ examId, rubrics = [], refreshKey, onCalibrated }) {
   const [students, setStudents] = useState([]);
   const [selected, setSelected] = useState("");
   const [booklet, setBooklet] = useState(null);
@@ -57,11 +57,14 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
 
   // Loading states
   const [isEvaluatingAll, setIsEvaluatingAll] = useState(false);
-  const [evaluatingAllModel, setEvaluatingAllModel] = useState("");
   const [evaluatingCard, setEvaluatingCard] = useState({});
   const [splittingCard, setSplittingCard] = useState({});
   const [deletingCard, setDeletingCard] = useState({});
   const [savingCard, setSavingCard] = useState({});
+  const rubricMap = useMemo(
+    () => new Map(rubrics.map((rubric) => [rubric.question_id, rubric])),
+    [rubrics]
+  );
 
   const load = async (studentId) => {
     if (!examId) return;
@@ -186,18 +189,16 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
   };
 
   // Step 3: Evaluate All Assigned Questions Against Rubrics
-  const handleEvaluateAll = async (scoringModel = "edueval") => {
+  const handleEvaluateAll = async () => {
     if (!selected) return;
     setError("");
     setMessage("");
     setIsEvaluatingAll(true);
-    setEvaluatingAllModel(scoringModel);
     try {
       const { data } = await evaluateStudent({
         exam_id: examId,
         student_id: selected,
         question_id: null,
-        scoring_model: scoringModel,
       });
       setRows(data.submissions || []);
       if (data.ia_breakdown) {
@@ -211,31 +212,25 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
         };
       });
       setDrafts(nextDrafts);
-      setMessage(
-        `Successfully evaluated all ${data.submissions.length} question answers with ${
-          scoringModel === "bert" ? "BERT" : "EduEval"
-        }.`
-      );
+      setMessage(`Successfully evaluated ${data.submissions.length} question answers with BERT.`);
       onCalibrated?.();
     } catch (e) {
       setError(e.response?.data?.detail || e.message);
     } finally {
       setIsEvaluatingAll(false);
-      setEvaluatingAllModel("");
     }
   };
 
   // Evaluate single question card on demand
-  const handleEvaluateSingleCard = async (qid, scoringModel = "edueval") => {
+  const handleEvaluateSingleCard = async (qid) => {
     setError("");
     setMessage("");
-    setEvaluatingCard((prev) => ({ ...prev, [qid]: scoringModel }));
+    setEvaluatingCard((prev) => ({ ...prev, [qid]: true }));
     try {
       const { data } = await evaluateStudent({
         exam_id: examId,
         student_id: selected,
         question_id: qid,
-        scoring_model: scoringModel,
       });
       setRows(data.submissions || []);
       if (data.ia_breakdown) {
@@ -249,12 +244,12 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
         };
       });
       setDrafts(nextDrafts);
-      setMessage(`Evaluated Question ${qid} with ${scoringModel === "bert" ? "BERT" : "EduEval"}.`);
+      setMessage(`Evaluated Question ${qid} with BERT.`);
       onCalibrated?.();
     } catch (e) {
       setError(e.response?.data?.detail || e.message);
     } finally {
-      setEvaluatingCard((prev) => ({ ...prev, [qid]: "" }));
+      setEvaluatingCard((prev) => ({ ...prev, [qid]: false }));
     }
   };
 
@@ -394,6 +389,17 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
         </div>
       )}
 
+      {booklet?.full_transcribed_text && (
+        <details className="surface-card" open>
+          <summary className="cursor-pointer text-sm font-bold text-slate-800">
+            Extracted OCR text (TrOCR)
+          </summary>
+          <pre className="mt-3 max-h-80 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-xs leading-relaxed text-slate-700">
+            {booklet.full_transcribed_text}
+          </pre>
+        </details>
+      )}
+
       {/* Main Two-Column Layout */}
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
         {/* LEFT COLUMN: Handwritten Booklet Viewer */}
@@ -499,27 +505,17 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
                 </h4>
               </div>
               <p className="text-xs text-slate-300 mt-0.5">
-                Run both graders independently to compare EduEval and BERT rubric scores.
+                BERT evaluates each answer against the reference answer and weighted rubric.
               </p>
             </div>
             <div className="flex flex-wrap gap-2">
               <button
                 type="button"
                 disabled={isEvaluatingAll || rows.length === 0}
-                onClick={() => handleEvaluateAll("edueval")}
-                className="bg-amber-400 hover:bg-amber-500 text-slate-950 font-extrabold text-xs px-4 py-2.5 rounded-lg inline-flex items-center gap-2 shadow transition-all disabled:opacity-50"
-              >
-                {isEvaluatingAll && evaluatingAllModel === "edueval" ? (
-                  <><RefreshCw className="w-4 h-4 animate-spin" /> Evaluating with EduEval...</>
-                ) : "Evaluate All with EduEval"}
-              </button>
-              <button
-                type="button"
-                disabled={isEvaluatingAll || rows.length === 0}
-                onClick={() => handleEvaluateAll("bert")}
+                onClick={handleEvaluateAll}
                 className="bg-indigo-400 hover:bg-indigo-300 text-slate-950 font-extrabold text-xs px-4 py-2.5 rounded-lg inline-flex items-center gap-2 shadow transition-all disabled:opacity-50"
               >
-                {isEvaluatingAll && evaluatingAllModel === "bert" ? (
+                {isEvaluatingAll ? (
                   <><RefreshCw className="w-4 h-4 animate-spin" /> Evaluating with BERT...</>
                 ) : "Evaluate All with BERT"}
               </button>
@@ -546,6 +542,7 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
             const pos = cursorPositions[sub.question_id] ?? 0;
             const targetQid = splitTargets[sub.question_id] || defaultTargetFor(sub.question_id);
             const textLength = cardTexts[sub.question_id]?.length || 0;
+            const maxMarks = Number(rubricMap.get(sub.question_id)?.max_marks ?? 5);
 
             return (
               <article key={sub.question_id} className="surface-card space-y-3 border border-slate-200">
@@ -556,7 +553,7 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
                       Question {sub.question_id}
                     </span>
                     <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-slate-100 text-slate-700">
-                      Max: 5 Marks
+                      Max: {maxMarks} Marks
                     </span>
                   </div>
 
@@ -565,38 +562,27 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
                     <button
                       type="button"
                       disabled={isEvaluating}
-                      onClick={() => handleEvaluateSingleCard(sub.question_id, "edueval")}
+                      onClick={() => handleEvaluateSingleCard(sub.question_id)}
                       className="text-xs font-semibold px-2.5 py-1 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 inline-flex items-center gap-1 transition-colors"
-                      title={`Re-evaluate Question ${sub.question_id}`}
+                      title={`Evaluate Question ${sub.question_id} with BERT`}
                     >
                       {isEvaluating ? (
                         <RefreshCw className="w-3 h-3 animate-spin" />
                       ) : (
                         <Search className="w-3 h-3" />
                       )}
-                      <span>{evaluatingCard[sub.question_id] === "edueval" ? "Evaluating..." : "EduEval"}</span>
-                    </button>
-                    <button
-                      type="button"
-                      disabled={isEvaluating}
-                      onClick={() => handleEvaluateSingleCard(sub.question_id, "bert")}
-                      className="text-xs font-semibold px-2.5 py-1 rounded-lg bg-violet-50 hover:bg-violet-100 text-violet-700 border border-violet-200 inline-flex items-center gap-1 transition-colors"
-                      title={`Evaluate Question ${sub.question_id} with BERT`}
-                    >
-                      {evaluatingCard[sub.question_id] === "bert" ? (
-                        <RefreshCw className="w-3 h-3 animate-spin" />
-                      ) : (
-                        <Search className="w-3 h-3" />
-                      )}
-                      <span>{evaluatingCard[sub.question_id] === "bert" ? "Evaluating..." : "BERT"}</span>
+                      <span>{isEvaluating ? "Evaluating with BERT..." : "Evaluate with BERT"}</span>
                     </button>
 
                     <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200 inline-flex items-center gap-1">
                       <Sparkles className="w-3 h-3 text-indigo-600" />
-                      EduEval Score: <b>{sub.ai_score ?? 0}</b> / 5
+                      BERT marks: <b>{sub.ai_score ?? 0}</b> / {maxMarks}
                     </span>
                     <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-violet-50 text-violet-700 border border-violet-200 inline-flex items-center gap-1">
-                      BERT Score: <b>{sub.bert_score ?? "—"}</b>
+                      Similarity: <b>{Math.round((sub.similarity_score ?? 0) * 100)}%</b>
+                    </span>
+                    <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-sky-50 text-sky-700 border border-sky-200 inline-flex items-center gap-1">
+                      Keyword coverage: <b>{Math.round((sub.keyword_coverage ?? 0) * 100)}%</b>
                     </span>
 
                     <span
@@ -710,7 +696,7 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
                   <div className="bg-emerald-50/60 border border-emerald-100 rounded-lg p-2.5">
                     <span className="text-xs font-bold text-emerald-800 block mb-1">
-                      EduEval Matched Points ({sub.matched_points?.length || 0})
+                      BERT Matched Criteria ({sub.matched_points?.length || 0})
                     </span>
                     {sub.matched_points?.length ? (
                       <ul className="text-xs text-emerald-950 space-y-1 list-disc pl-4">
@@ -725,7 +711,7 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
 
                   <div className="bg-red-50/60 border border-red-100 rounded-lg p-2.5">
                     <span className="text-xs font-bold text-red-800 block mb-1">
-                      EduEval Missing Points ({sub.missing_points?.length || 0})
+                      BERT Missing Criteria ({sub.missing_points?.length || 0})
                     </span>
                     {sub.missing_points?.length ? (
                       <ul className="text-xs text-red-950 space-y-1 list-disc pl-4">
@@ -738,9 +724,9 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
                     )}
                   </div>
                 </div>
-                {sub.bert_feedback && (
+                {sub.ai_feedback && (
                   <p className="text-xs text-violet-800 bg-violet-50 border border-violet-100 rounded-lg px-3 py-2">
-                    BERT: {sub.bert_feedback}
+                    BERT feedback: {sub.ai_feedback}
                   </p>
                 )}
 
@@ -754,7 +740,7 @@ export default function ReviewGrade({ examId, refreshKey, onCalibrated }) {
                       type="number"
                       step="0.5"
                       min="0"
-                      max="5"
+                      max={maxMarks}
                       className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-bold text-center text-slate-900 bg-white"
                       value={drafts[sub.question_id]?.teacher_score ?? 0}
                       onChange={(e) =>

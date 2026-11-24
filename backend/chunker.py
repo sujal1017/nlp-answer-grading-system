@@ -177,9 +177,7 @@ def _match_orphan_subquestion(
 ) -> str:
     """
     Semantic Topic Routing for orphan sub-questions (e.g. a) or b) written without main number):
-    1. Compares first 250 characters of answer_text against candidate rubric questions ending with sub_letter
-       using all-MiniLM-L6-v2 cosine similarity.
-    2. Falls back to RapidFuzz and keyword overlap if embedder is unavailable.
+    Match a numbered rubric by fuzzy text similarity and prefer unused questions on ties.
     """
     candidates = [r for r in rubrics if str(r.get("question_id", "")).upper().endswith(sub_letter.upper())]
     if not candidates:
@@ -193,22 +191,6 @@ def _match_orphan_subquestion(
                 return qid
         return str(candidates[0]["question_id"]).upper()
 
-    # 1. Semantic Topic Routing using all-MiniLM-L6-v2
-    try:
-        from scorer import get_embedder
-        import numpy as np
-        embedder = get_embedder()
-        if embedder is not None:
-            cand_texts = [c.get("question_text", "") for c in candidates]
-            cand_embs = embedder.encode(cand_texts, convert_to_numpy=True, normalize_embeddings=True)
-            probe_emb = embedder.encode([probe_text], convert_to_numpy=True, normalize_embeddings=True)[0]
-            sims = np.dot(cand_embs, probe_emb)
-            best_idx = int(np.argmax(sims))
-            return str(candidates[best_idx]["question_id"]).upper()
-    except Exception:
-        pass
-
-    # 2. Fallback using RapidFuzz token_set_ratio + keyword overlap
     best_qid = str(candidates[0]["question_id"]).upper()
     best_score = -1.0
     for c in candidates:
@@ -331,7 +313,7 @@ def chunk_student_booklet(
       4. Treat standalone headings as semantic anchors against active teacher questions using RapidFuzz.
       5. Strictly validate all output keys to match ^Q[1-3][A-B]$ (never naked Q1 or Q2).
       6. Exclude Roman numerals and indented lists from triggering false question splits.
-      7. Semantically route orphan sub-questions via all-MiniLM-L6-v2 embeddings.
+      7. Route orphan sub-questions using fuzzy text matching.
     """
     rubrics = rubrics or []
     if margin_anchors:

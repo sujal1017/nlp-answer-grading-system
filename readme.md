@@ -1,130 +1,69 @@
-# AI Grader - Automated Handwritten Evaluation System
+# Handwriting OCR and BERT Answer Grading
 
-A local optical character recognition and evaluation pipeline that processes handwritten test papers into clean, structured Markdown using the open-weight Qwen2-VL model.
+This application digitizes handwritten answer booklets and grades answers against teacher-authored reference answers and weighted rubrics.
 
----
+## Pipeline
 
-## 1. Project Overview and Working Mechanism
+1. Accept PDF, PNG, JPG, or JPEG uploads.
+2. Convert PDF pages to PNG with PyMuPDF, preserving upload and page order.
+3. Preprocess each page with OpenCV and segment the handwriting into line images.
+4. Read the line images with `microsoft/trocr-base-handwritten`.
+5. Save the complete transcript for teacher review and split it into question answers.
+6. Grade each answer with the BERT encoder `sentence-transformers/bert-base-nli-mean-tokens`, using the rubric, optional teacher reference answer, semantic similarity, and keyword coverage.
+7. Show marks, similarity, coverage, and feedback in Batch Grading and Review & Calibrate.
 
-1. **Input**: Scanned or photographed images of handwritten exam sheets are placed in the `data/` folder.
-2. **Vision-Language Processing**: The local `Qwen/Qwen2-VL-2B-Instruct` model ingests the image directly and parses handwriting, layout headers, dates, and bulleted lists.
-3. **Markdown Normalization**: The transcription is written to a structured `.md` file, which can be used as standardized input for later rubric grading steps.
-4. **Local Hardware Execution**: The pipeline runs on the host machine with PyTorch and CUDA acceleration, avoiding external API costs, transmission latency, and service rate limits.
-5. **Scoring Comparison**: The review screen can run the existing EduEval grader or a separate BERT MNLI entailment scorer. Both scores are retained for side-by-side comparison; OCR is unchanged.
+OCR and BERT weights load lazily on the first corresponding request and are cached by Hugging Face. They are not downloaded during application startup. TrOCR is unloaded before BERT grading, and both models are released after a grading job. CUDA is used when available; CPU execution works without CUDA.
 
----
+Question labels in the booklet (for example `Q1A`, `Q1B`) improve automatic answer segmentation. If no sections can be matched, the OCR transcript remains saved and is available for manual review and assignment.
 
-## 2. Directory Structure
+## Install and run on Windows PowerShell
 
-```text
-ai-grader/
-|
-|-- data/
-|   |-- answer.jpeg
-|   |-- answer2.jpeg
-|   |-- answer3.jpeg
-|
-|-- ocr.py                 # Core extraction and transcription script
-|-- qwen_ocr_output.md     # Generated Markdown output
-`-- readme.md              # Project documentation
-```
+Use Python 3.11 or 3.12. Open two PowerShell terminals in the project directory.
 
----
-
-## 3. Environment and Hardware Prerequisites
-
-- **Operating System**: Windows 10/11 or a modern Linux distribution
-- **Python**: 3.10-3.13
-- **Hardware**: Dedicated NVIDIA GPU with at least 6 GB VRAM, such as an RTX 3050, RTX 4050, or higher, for accelerated inference
-
----
-
-## 4. Step-by-Step Installation
-
-### Step A: Clone the Repository and Configure a Virtual Environment
-
-Open your terminal in the target workspace and set up an isolated environment:
-
-```bash
-git clone <your-repository-url>
-cd ai-grader
-python -m venv venv
-```
-
-Activate the environment.
-
-On Windows CMD or PowerShell:
+### Backend
 
 ```powershell
-venv\Scripts\activate
+cd .\backend
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-On Linux or macOS:
-
-```bash
-source venv/bin/activate
-```
-
-### Step B: Install PyTorch with CUDA Support
-
-A standard `pip install torch` may install CPU-only binaries. Use the dedicated wheel index that matches your NVIDIA driver and CUDA toolchain. For CUDA 12.6:
-
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-```
-
-Verify that PyTorch can detect your dedicated GPU:
-
-```bash
-python -c "import torch; print('CUDA Available:', torch.cuda.is_available())"
-```
-
-Expected output:
-
-```text
-CUDA Available: True
-```
-
-If the command returns `False`, verify your NVIDIA drivers and reinstall the CUDA-enabled PyTorch build.
-
-### Step C: Install Model Dependencies
-
-Install the libraries needed for multimodal input formatting and model loading:
-
-```bash
-pip install transformers accelerate torchvision qwen-vl-utils
-```
-
-### Step D: Enable the BERT Scoring Checkpoint
-
-The optional comparison scorer uses `textattack/bert-base-uncased-MNLI` and runs on CPU so it does not compete with Qwen for GPU memory. The first BERT evaluation needs the checkpoint in the local Hugging Face cache. Since this project defaults to offline Hugging Face operation, temporarily allow the download before starting the backend:
+If PowerShell blocks virtual-environment activation, run the backend with the interpreter directly:
 
 ```powershell
-$env:HF_HUB_OFFLINE = "0"
-$env:TRANSFORMERS_OFFLINE = "0"
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Run one BERT evaluation while connected to the internet to populate the cache. After that, the scorer can run offline. In **Review & Calibrate**, use **Evaluate All with BERT** or the per-question **BERT** button; the stored BERT score appears beside the existing EduEval score. Existing scores and the Qwen OCR workflow are not replaced.
+PyTorch can use a compatible NVIDIA CUDA runtime when one is installed. It falls back to CPU if CUDA is unavailable or model placement runs out of GPU memory. CUDA is not required.
 
----
+### Frontend
 
-## 5. Running the Pipeline
+```powershell
+cd .\frontend
+npm install
+npm run dev
+```
 
-1. Place the target test image inside the `data/` directory.
-2. Update `image_file` in `ocr.py` if you want to process a different file. The current script uses `data/answer4.jpeg`.
-3. Run the main processing script:
+Open the local URL printed by Vite (normally `http://localhost:5173`). The backend API documentation is available at `http://127.0.0.1:8000/docs`.
 
-   ```bash
-   python ocr.py
-   ```
+## Models and grading
 
-4. On the first run, Hugging Face downloads the `Qwen2-VL-2B-Instruct` checkpoint, which is roughly 4.5 GB, into your local cache directory. Later runs load the model from disk.
-5. When processing finishes, inspect `qwen_ocr_output.md` to review the extracted Markdown text.
+- OCR: `microsoft/trocr-base-handwritten`
+- Grading: `sentence-transformers/bert-base-nli-mean-tokens` loaded through Transformers as a BERT encoder
+- Each question's maximum score is enforced by its rubric weights.
+- A teacher reference answer is optional; when omitted, the rubric criteria are used as the semantic reference.
+- Review & Calibrate retains teacher score verification and rubric-weight calibration.
 
----
+## Tests
 
-## 6. Troubleshooting Common Issues
+From the project directory:
 
-- **`torch.cuda.is_available()` returns `False`**: You may be using a CPU-only PyTorch build. Run `pip uninstall torch torchvision -y`, then reinstall PyTorch using the CUDA wheel index shown in Step B.
-- **Process defaults to Intel or integrated GPU**: Ensure the script uses `device_map="auto"` and set your operating system's graphics preference for the Python executable to high-performance NVIDIA graphics.
-- **Out-of-memory errors**: If high-resolution images exhaust VRAM, downscale the input image or reduce `max_new_tokens` in the generation call inside `ocr.py`.
+```powershell
+.\backend\.venv\Scripts\python.exe -m unittest discover -s .\backend -p "test_*.py" -v
+```
+
+The tests cover PDF page conversion, OpenCV line segmentation, bounded BERT rubric scoring, reference-answer persistence, and the batch and individual grading APIs. Model downloads and full OCR inference are deliberately excluded from the automated suite.
