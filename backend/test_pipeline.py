@@ -2,6 +2,8 @@
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -15,6 +17,7 @@ from engine import (
     extract_left_margin_marker,
 )
 from scorer import evaluate_with_edueval, clean_ocr_text
+from bert_scorer import _entailment_index, evaluate_with_bert
 from database import (
     init_db,
     get_connection,
@@ -853,6 +856,73 @@ def test_edueval_deterministic_scoring_q1a():
     print(f"  [ok] EduEval deterministic grading awarded {score}/{max_marks} marks with {len(matched)} criteria matched")
 
 
+def test_bert_rubric_scoring_comparison():
+    rubric = [
+        {"point": "Research is systematic investigation", "weight": 2.5},
+        {"point": "Research uses evidence", "weight": 2.5},
+    ]
+    answer = "Research is a systematic investigation based on evidence and observation."
+    with patch("bert_scorer._score_entailment_pairs", return_value=[0.8, 0.2, 0.1, 0.1]):
+        result = evaluate_with_bert("Explain research", 5, rubric, answer)
+
+    assert result["matched_points"] == ["Research is systematic investigation"]
+    assert result["missing_points"] == ["Research uses evidence"]
+    assert result["ai_score"] == 2.0
+    assert "BERT (MNLI)" in result["ai_feedback"]
+    mnli_model = SimpleNamespace(
+        config=SimpleNamespace(
+            id2label={0: "LABEL_0", 1: "LABEL_1", 2: "LABEL_2"},
+            finetuning_task="mnli",
+        )
+    )
+    assert _entailment_index(mnli_model) == 1
+    print("  [ok] BERT rubric entailment scores are kept separate for comparison")
+
+
+def test_bert_endpoint_persists_score_without_replacing_edueval():
+    from fastapi.testclient import TestClient
+    from main import app, engine
+
+    exam_id = "IA1_RM_2026"
+    student_id = "TEST_BERT_SCORE_COMPARISON"
+    delete_all_student_submissions(exam_id, student_id)
+    save_student_answer(
+        exam_id,
+        student_id,
+        "Q1A",
+        [],
+        "Research is a systematic investigation to discover knowledge.",
+    )
+
+    try:
+        with patch.object(
+            engine,
+            "evaluate_answer_bert",
+            return_value={
+                "ai_score": 4.0,
+                "ai_feedback": "BERT (MNLI) found entailment for 3 of 4 rubric criteria.",
+            },
+        ):
+            response = TestClient(app).post(
+                "/api/submissions/evaluate-student",
+                json={
+                    "exam_id": exam_id,
+                    "student_id": student_id,
+                    "scoring_model": "bert",
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        submission = response.json()["submissions"][0]
+        assert submission["bert_score"] == 4.0
+        assert submission["ai_score"] == 0.0
+        assert submission["bert_feedback"].startswith("BERT (MNLI)")
+    finally:
+        delete_all_student_submissions(exam_id, student_id)
+
+    print("  [ok] BERT API evaluation persists separately from the EduEval score")
+
+
 def test_dump_q1a_split_char0_and_evaluate_workflow():
     """
     End-to-end integration test of the 3-step teacher workflow:
@@ -1019,4 +1089,6 @@ if __name__ == "__main__":
     test_database_and_calibration()
     test_transcribe_images_fallback_retry_recovers_page()
     test_edueval_deterministic_scoring_q1a()
+    test_bert_rubric_scoring_comparison()
+    test_bert_endpoint_persists_score_without_replacing_edueval()
     print("\nAll EvalAI pipeline tests passed successfully!")

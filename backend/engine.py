@@ -619,3 +619,19 @@ class LocalGradingEngine:
             student_answer=student_answer,
             verified_examples=verified_examples,
         )
+
+    def evaluate_answer_bert(
+        self,
+        question_text: str,
+        max_marks: float,
+        key_points: List[Union[Dict, str]],
+        student_answer: str,
+    ) -> Dict:
+        """Evaluate an answer using the pretrained BERT MNLI comparison scorer."""
+        from bert_scorer import evaluate_with_bert
+        return evaluate_with_bert(
+            question_text=question_text,
+            max_marks=max_marks,
+            key_points=key_points,
+            student_answer=student_answer,
+        )

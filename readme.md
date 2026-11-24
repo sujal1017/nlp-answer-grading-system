@@ -10,6 +10,7 @@ A local optical character recognition and evaluation pipeline that processes han
 2. **Vision-Language Processing**: The local `Qwen/Qwen2-VL-2B-Instruct` model ingests the image directly and parses handwriting, layout headers, dates, and bulleted lists.
 3. **Markdown Normalization**: The transcription is written to a structured `.md` file, which can be used as standardized input for later rubric grading steps.
 4. **Local Hardware Execution**: The pipeline runs on the host machine with PyTorch and CUDA acceleration, avoiding external API costs, transmission latency, and service rate limits.
+5. **Scoring Comparison**: The review screen can run the existing EduEval grader or a separate BERT MNLI entailment scorer. Both scores are retained for side-by-side comparison; OCR is unchanged.
 
 ---
 
@@ -93,6 +94,17 @@ Install the libraries needed for multimodal input formatting and model loading:
 ```bash
 pip install transformers accelerate torchvision qwen-vl-utils
 ```
+
+### Step D: Enable the BERT Scoring Checkpoint
+
+The optional comparison scorer uses `textattack/bert-base-uncased-MNLI` and runs on CPU so it does not compete with Qwen for GPU memory. The first BERT evaluation needs the checkpoint in the local Hugging Face cache. Since this project defaults to offline Hugging Face operation, temporarily allow the download before starting the backend:
+
+```powershell
+$env:HF_HUB_OFFLINE = "0"
+$env:TRANSFORMERS_OFFLINE = "0"
+```
+
+Run one BERT evaluation while connected to the internet to populate the cache. After that, the scorer can run offline. In **Review & Calibrate**, use **Evaluate All with BERT** or the per-question **BERT** button; the stored BERT score appears beside the existing EduEval score. Existing scores and the Qwen OCR workflow are not replaced.
 
 ---
 

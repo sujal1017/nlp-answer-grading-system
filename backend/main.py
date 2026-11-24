@@ -2,7 +2,7 @@ import os
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,6 +38,7 @@ from database import (
     split_at_cursor,
     split_submission,
     update_evaluation,
+    update_bert_evaluation,
     update_rubric_weights_from_feedback,
     verify_submission,
 )
@@ -130,6 +131,7 @@ class EvaluateStudentRequest(BaseModel):
     exam_id: str
     student_id: str
     question_id: Optional[str] = None
+    scoring_model: Literal["edueval", "bert"] = "edueval"
 
 
 class AssignSegmentRequest(BaseModel):
@@ -400,11 +402,8 @@ def split_submission_endpoint(payload: SplitRequest):
 @app.post("/api/submissions/evaluate-student")
 def evaluate_student_endpoint(payload: EvaluateStudentRequest):
     """
-    Step 3: Evaluate All Assigned Questions Against Rubrics using EduEval:
-      - Runs evaluate_with_edueval against question rubrics for all assigned cards
-        (or single card if question_id is provided).
-      - Updates matched_points, missing_points, ai_score, and ai_feedback.
-      - Returns updated submissions and live SDMCET IA Choice Rule Total (max(Q1, Q2) + Q3).
+    Step 3: Evaluate assigned answers using EduEval or BERT MNLI.
+    The default preserves EduEval behavior; BERT scores are stored separately.
     """
     eid = payload.exam_id.strip().upper()
     sid = payload.student_id.strip().upper()
@@ -423,28 +422,46 @@ def evaluate_student_endpoint(payload: EvaluateStudentRequest):
         ans_text = s.get("transcribed_text") or ""
         if q_id in rubric_map:
             r_info = rubric_map[q_id]
-            past = get_verified_examples(eid, q_id, limit=2)
-            eval_res = engine.evaluate_answer(
-                question_text=r_info["question_text"],
-                max_marks=r_info["max_marks"],
-                key_points=r_info["key_points"],
-                student_answer=ans_text,
-                verified_examples=past,
-            )
-            update_evaluation(
-                exam_id=eid,
-                student_id=sid,
-                question_id=q_id,
-                matched_points=eval_res["matched_points"],
-                missing_points=eval_res["missing_points"],
-                ai_score=eval_res["ai_score"],
-                ai_feedback=eval_res["ai_feedback"],
-            )
+            if payload.scoring_model == "bert":
+                eval_res = engine.evaluate_answer_bert(
+                    question_text=r_info["question_text"],
+                    max_marks=r_info["max_marks"],
+                    key_points=r_info["key_points"],
+                    student_answer=ans_text,
+                )
+                update_bert_evaluation(
+                    exam_id=eid,
+                    student_id=sid,
+                    question_id=q_id,
+                    bert_score=eval_res["ai_score"],
+                    bert_feedback=eval_res["ai_feedback"],
+                )
+            else:
+                past = get_verified_examples(eid, q_id, limit=2)
+                eval_res = engine.evaluate_answer(
+                    question_text=r_info["question_text"],
+                    max_marks=r_info["max_marks"],
+                    key_points=r_info["key_points"],
+                    student_answer=ans_text,
+                    verified_examples=past,
+                )
+                update_evaluation(
+                    exam_id=eid,
+                    student_id=sid,
+                    question_id=q_id,
+                    matched_points=eval_res["matched_points"],
+                    missing_points=eval_res["missing_points"],
+                    ai_score=eval_res["ai_score"],
+                    ai_feedback=eval_res["ai_feedback"],
+                )
 
     updated_subs = get_exam_submissions(eid, sid)
     for row in updated_subs:
         row["image_urls"] = [public_file_url(p) for p in row.get("image_paths", [])]
-    scores = {r["question_id"]: float(r["teacher_score"] or r["ai_score"] or 0.0) for r in updated_subs}
+    if payload.scoring_model == "bert":
+        scores = {r["question_id"]: float(r["bert_score"] or 0.0) for r in updated_subs}
+    else:
+        scores = {r["question_id"]: float(r["teacher_score"] or r["ai_score"] or 0.0) for r in updated_subs}
     ia_breakdown = calculate_ia_total(scores)
 
     return {

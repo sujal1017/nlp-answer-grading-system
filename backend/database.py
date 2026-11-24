@@ -266,6 +266,8 @@ def init_db():
             missing_points TEXT,
             ai_score REAL DEFAULT 0.0,
             ai_feedback TEXT,
+            bert_score REAL,
+            bert_feedback TEXT,
             teacher_score REAL,
             teacher_verified INTEGER DEFAULT 0,
             status TEXT DEFAULT 'Uploaded',
@@ -274,6 +276,14 @@ def init_db():
         )
         """
     )
+
+    submission_columns = {
+        row["name"] for row in cursor.execute("PRAGMA table_info(submissions)").fetchall()
+    }
+    if "bert_score" not in submission_columns:
+        cursor.execute("ALTER TABLE submissions ADD COLUMN bert_score REAL")
+    if "bert_feedback" not in submission_columns:
+        cursor.execute("ALTER TABLE submissions ADD COLUMN bert_feedback TEXT")
 
     conn.commit()
     seed_default_exam(conn)
@@ -478,6 +488,8 @@ def save_student_answer(
             image_paths = excluded.image_paths,
             transcribed_text = excluded.transcribed_text,
             ai_score = excluded.ai_score,
+            bert_score = NULL,
+            bert_feedback = NULL,
             status = 'Transcribed',
             teacher_verified = 0
         """,
@@ -522,6 +534,31 @@ def update_evaluation(
             sid,
             qid,
         ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_bert_evaluation(
+    exam_id: str,
+    student_id: str,
+    question_id: str,
+    bert_score: float,
+    bert_feedback: str,
+):
+    eid = exam_id.strip().upper()
+    sid = student_id.strip().upper()
+    qid = question_id.strip().upper()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE submissions
+        SET bert_score = ?,
+            bert_feedback = ?
+        WHERE exam_id = ? AND student_id = ? AND question_id = ?
+        """,
+        (bert_score, bert_feedback, eid, sid, qid),
     )
     conn.commit()
     conn.close()
@@ -573,6 +610,8 @@ def get_exam_submissions(exam_id: str, student_id: Optional[str] = None) -> List
         item["matched_points"] = json.loads(item["matched_points"]) if item["matched_points"] else []
         item["missing_points"] = json.loads(item["missing_points"]) if item["missing_points"] else []
         item["ai_score"] = float(item["ai_score"]) if item.get("ai_score") is not None else 0.0
+        if item.get("bert_score") is not None:
+            item["bert_score"] = float(item["bert_score"])
         result.append(item)
     return result
 
