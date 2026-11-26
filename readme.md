@@ -1,4 +1,4 @@
-# EvalAI — Automated Handwritten Exam Evaluation Platform
+# RubrixAI — Automated Handwritten Exam Evaluation Platform
 
 EvalAI is an end-to-end, offline-capable handwritten exam evaluation system tailored for university examinations and internal assessments (IA). It combines local Vision-Language Models (Qwen2-VL), reference textbook Retrieval-Augmented Generation (RAG), multi-tier semantic answer sheet chunking, anti-stuffing cross-encoder verification, and institutional choice-rule grading into a unified full-stack application.
 
