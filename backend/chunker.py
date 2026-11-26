@@ -228,7 +228,7 @@ def _semantic_heading_qid(line: str, rubrics: List[Dict]) -> Optional[str]:
 
     for r in rubrics:
         qid = str(r.get("question_id", "")).upper()
-        if not re.match(r"^Q[1-3][A-B]$", qid):
+        if not re.match(r"^Q\d+[A-Z]$", qid):
             continue
         q_text = r.get("question_text", "")
         ratio = fuzz.token_set_ratio(line_l, q_text.lower())
@@ -250,7 +250,7 @@ def merge_two_tier_margins(text: str) -> str:
         return f"\nQ{q_num}{sub}) "
 
     pattern = re.compile(
-        r"(?:^|\n)\s*(?:Q(?:uestion)?\.?\s*(?:No\.?)?\s*|Ans(?:wer)?\.?\s*)?([1-3])\s*[\]).:-]?\s*\n\s*[([]?\s*([a-dA-D6])\s*[)\]:.-]?\s*",
+        r"(?:^|\n)\s*(?:Q(?:uestion)?\.?\s*(?:No\.?)?\s*|Ans(?:wer)?\.?\s*)?(\d+)\s*[\]).:-]?\s*\n\s*[([]?\s*([a-zA-Z6])\s*[)\]:.-]?\s*",
         re.IGNORECASE,
     )
     return pattern.sub(_repl, text)
@@ -267,14 +267,14 @@ def normalize_margin_markers(text: str) -> str:
     )
     # Ans 1a: / Answer 1(a) / Ans 1(b) / Ans. 1 a / Ans 1-a
     text = re.sub(
-        r"(?:^|\n)\s*Ans(?:wer)?\.?\s*(?:No\.?)?\s*([1-3])\s*[([.\-\s]*([a-dA-D])\s*[)\]:.\-]?",
+        r"(?:^|\n)\s*Ans(?:wer)?\.?\s*(?:No\.?)?\s*(\d+)\s*[([.\-\s]*([a-zA-Z])\s*[)\]:.\-]?",
         lambda m: f"\nQ{m.group(1)}{m.group(2).upper()}) ",
         text,
         flags=re.IGNORECASE,
     )
     # Q1 (a) / Q1(a) / Question 1(a) / 1 (a) / 1(a) / 1] a / 3] a / 3) a / 1. a / 1 a) / 3b) / Q1] a] / 1] a]
     text = re.sub(
-        r"(?:^|\n)\s*(?:Q(?:uestion)?\.?\s*(?:No\.?)?\s*)?([1-3])\s*[\]).:-]?\s*[([]?\s*([a-dA-D])(?:\s*[)\]:.-]|\s+)",
+        r"(?:^|\n)\s*(?:Q(?:uestion)?\.?\s*(?:No\.?)?\s*)?(\d+)\s*[\]).:-]?\s*[([]?\s*([a-zA-Z])(?:\s*[)\]:.-]|\s+)",
         lambda m: f"\nQ{m.group(1)}{m.group(2).upper()}) ",
         text,
         flags=re.IGNORECASE,
@@ -311,7 +311,7 @@ def chunk_student_booklet(
       2. Regex-normalize OCR margin quirks (2] (6) -> Q2B, 36) -> Q3B, 3] a -> Q3A).
       3. Track current_qid and transition standalone sub-letters (e.g. b] when current is Q1A -> Q1B).
       4. Treat standalone headings as semantic anchors against active teacher questions using RapidFuzz.
-      5. Strictly validate all output keys to match ^Q[1-3][A-B]$ (never naked Q1 or Q2).
+      5. Retain all numbered answer-part keys so unsupported questions can be manually assigned.
       6. Exclude Roman numerals and indented lists from triggering false question splits.
       7. Route orphan sub-questions using fuzzy text matching.
     """
@@ -346,7 +346,7 @@ def chunk_student_booklet(
 
         # Standalone Sub-Letter Transition: line starts with b), b], (b), (6), 6)
         standalone_sub = re.match(
-            r"^(?:#+\s*)?(?:Ans(?:wer)?\.?\s*)?(?:[([]\s*([a-dA-D6])\s*[)\]]|([a-dA-D6])\s*[)\]:.-])(?:\s+|$)(.*)$",
+            r"^(?:#+\s*)?(?:Ans(?:wer)?\.?\s*)?(?:[([]\s*([a-zA-Z6])\s*[)\]]|([a-zA-Z6])\s*[)\]:.-])(?:\s+|$)(.*)$",
             line,
             re.IGNORECASE,
         )
@@ -356,8 +356,8 @@ def chunk_student_booklet(
             rest = (standalone_sub.group(3) or "").strip()
 
             target_qid = None
-            if sub_let == "B" and current_qid and current_qid in {"Q1A", "Q2A", "Q3A"}:
-                target_qid = current_qid[:2] + "B"
+            if sub_let == "B" and current_qid and re.match(r"^Q\d+A$", current_qid):
+                target_qid = current_qid[:-1] + "B"
             elif last_main:
                 target_qid = f"Q{last_main}{sub_let}"
             else:
@@ -370,14 +370,15 @@ def chunk_student_booklet(
 
             if target_qid:
                 current_qid = target_qid
-                last_main = target_qid[1]
+                main_match = re.match(r"^Q(\d+)", target_qid)
+                last_main = main_match.group(1) if main_match else last_main
                 boundaries.append((idx, target_qid))
                 continue
 
         # Standalone main question marker (multi-tier parent): e.g. "Question 1", "Q1", "Q1]", "1]", "[1]", "Ans 1:", "Q.1", "1."
         main_only = re.match(
-            r"^(?:#+\s*)?(?:(?:Q(?:uestion)?\.?\s*(?:No\.?)?|Ans(?:wer)?\.?)\s*[([]?\s*([1-3])\s*[)\]:.-]?|"
-            r"[([]\s*([1-3])\s*[)\]]|([1-3])\s*[)\]:.-])\s*$",
+            r"^(?:#+\s*)?(?:(?:Q(?:uestion)?\.?\s*(?:No\.?)?|Ans(?:wer)?\.?)\s*[([]?\s*(\d+)\s*[)\]:.-]?|"
+            r"[([]\s*(\d+)\s*[)\]]|(\d+)\s*[)\]:.-])\s*$",
             line,
             re.IGNORECASE,
         )
@@ -389,9 +390,9 @@ def chunk_student_booklet(
         hm = re.match(
             r"^(?:#+\s*)?(?:Q(?:uestion)?\.?\s*(?:No\.?)?\s*|Ans(?:wer)?\.?\s*)?"
             r"(?:"
-            r"([1-3])\s*[)\].\-\s]*[([]?\s*([a-dA-D6])\s*[)\].:\-\s]|"
-            r"[([]\s*([a-dA-D6])\s*[)\]]\s*|"
-            r"([a-dA-D])\s*[)\]:.-]\s*"
+            r"(\d+)\s*[)\].\-\s]*[([]?\s*([a-zA-Z6])\s*[)\].:\-\s]|"
+            r"[([]\s*([a-zA-Z6])\s*[)\]]\s*|"
+            r"([a-zA-Z])\s*[)\]:.-]\s*"
             r")\s*(.*)$",
             line,
             re.IGNORECASE,
@@ -404,8 +405,8 @@ def chunk_student_booklet(
             if q_num:
                 last_main = q_num
                 qid = f"Q{q_num}{sub_let}"
-            elif current_qid and sub_let == "B" and current_qid in {"Q1A", "Q2A", "Q3A"}:
-                qid = current_qid[:2] + "B"
+            elif current_qid and sub_let == "B" and re.match(r"^Q\d+A$", current_qid):
+                qid = current_qid[:-1] + "B"
             elif last_main:
                 qid = f"Q{last_main}{sub_let}"
             else:
@@ -415,7 +416,7 @@ def chunk_student_booklet(
                     rubrics,
                     [b[1] for b in boundaries],
                 )
-                maybe_n = re.match(r"^Q(\d)", qid)
+                maybe_n = re.match(r"^Q(\d+)", qid)
                 if maybe_n:
                     last_main = maybe_n.group(1)
             current_qid = qid
@@ -424,7 +425,7 @@ def chunk_student_booklet(
 
         semantic = _semantic_heading_qid(line, rubrics)
         if semantic:
-            maybe_n = re.match(r"^Q(\d)", semantic)
+            maybe_n = re.match(r"^Q(\d+)", semantic)
             if maybe_n:
                 last_main = maybe_n.group(1)
             current_qid = semantic
@@ -442,16 +443,15 @@ def chunk_student_booklet(
             if block_lines:
                 block_lines = [re.sub(
                     r"^(?:#+\s*)?(?:Q(?:uestion)?\.?\s*(?:No\.?)?\s*|Ans(?:wer)?\.?\s*)?"
-                    r"(?:[1-3]\s*[)\].\-\s]*[(\[]?\s*[a-dA-D6]\s*[)\].:\-\s]|(?:[a-dA-D]|[([]?\s*6\s*[)\]])\s*[).:\]\-\s]?)\s*",
+                    r"(?:\d+\s*[)\].\-\s]*[(\[]?\s*[a-zA-Z6]\s*[)\].:\-\s]|(?:[a-zA-Z]|[([]?\s*6\s*[)\]])\s*[).:\]\-\s]?)\s*",
                     "",
                     block_lines[0],
                     flags=re.IGNORECASE,
                 )] + block_lines[1:]
             content = "\n".join(block_lines).strip()
-            if not content:
-                continue
             if qid in raw_chunks:
-                raw_chunks[qid] += f"\n\n{content}"
+                if content:
+                    raw_chunks[qid] = f"{raw_chunks[qid]}\n\n{content}".strip()
             else:
                 raw_chunks[qid] = content
 
@@ -463,21 +463,22 @@ def chunk_student_booklet(
             if pqid:
                 raw_chunks[pqid] = (preamble + "\n\n" + raw_chunks.get(pqid, "")).strip()
 
-    # Strict Key Validation: Never output naked keys like Q1, Q2, or Q3.
-    # Every key MUST match ^Q[1-3][A-B]$
+    # Keep unsupported numbered parts for the caller to report and expose for manual mapping.
     valid_chunks: Dict[str, str] = {}
     for k, v in raw_chunks.items():
         k_clean = k.strip().upper()
-        if re.match(r"^Q[1-3][A-B]$", k_clean):
+        if re.match(r"^Q\d+[A-Z]$", k_clean) or any(
+            str(r.get("question_id", "")).strip().upper() == k_clean for r in rubrics
+        ):
             if k_clean in valid_chunks:
                 valid_chunks[k_clean] += "\n\n" + v
             else:
                 valid_chunks[k_clean] = v
         else:
-            match_main = re.match(r"^Q?([1-3])$", k_clean)
-            target_main = match_main.group(1) if match_main else "1"
-            cand_a = f"Q{target_main}A"
-            cand_b = f"Q{target_main}B"
+            match_main = re.match(r"^Q?(\d+)$", k_clean)
+            target_main = match_main.group(1) if match_main else None
+            cand_a = f"Q{target_main}A" if target_main else ""
+            cand_b = f"Q{target_main}B" if target_main else ""
 
             text_a = ""
             text_b = ""
@@ -491,7 +492,7 @@ def chunk_student_booklet(
             sim_a = fuzz.token_set_ratio(v.lower(), text_a.lower())
             sim_b = fuzz.token_set_ratio(v.lower(), text_b.lower())
 
-            resolved_key = cand_a if sim_a >= sim_b else cand_b
+            resolved_key = (cand_a if sim_a >= sim_b else cand_b) if target_main else k_clean
             if resolved_key in valid_chunks:
                 valid_chunks[resolved_key] += "\n\n" + v
             else:

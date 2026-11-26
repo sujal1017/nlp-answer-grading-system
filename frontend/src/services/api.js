@@ -9,6 +9,7 @@ export const getTelemetry = () => api.get("/telemetry");
 export const unloadEngine = () => api.post("/engine/unload");
 export const getExams = () => api.get("/exams");
 export const getExam = (examId) => api.get(`/exams/${examId}`);
+export const getExamRubrics = (examId) => api.get(`/exams/${examId}/rubrics`);
 export const upsertExam = (payload) => api.post("/exams", payload);
 export const parseQuestions = (text) => api.post("/parse-questions", { text });
 export const updateRubric = (examId, questionId, payload) =>
@@ -45,6 +46,8 @@ export const getSampleBooklets = () => api.get("/sample-booklets");
 export const gradeSampleBooklet = (examId, payload) =>
   api.post(`/exams/${examId}/grade-sample`, payload);
 export const getJob = (jobId) => api.get(`/jobs/${jobId}`);
+export const gradeManualAnswers = (examId, payload) =>
+  api.post(`/exams/${examId}/grade-manual`, payload);
 export const verifyAnswer = (payload) => api.post("/verify", payload);
 export const getIaTotal = (examId, studentId) => api.get(`/exams/${examId}/ia/${studentId}`);
 

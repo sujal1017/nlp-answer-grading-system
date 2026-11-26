@@ -1,6 +1,24 @@
 import { useEffect, useState } from "react";
-import { Rocket, Upload, CheckCircle2, AlertTriangle, ArrowRight, Layers } from "lucide-react";
-import { getJob, getSampleBooklets, gradeBooklet, gradeSampleBooklet } from "../services/api";
+import {
+  Rocket,
+  Upload,
+  CheckCircle2,
+  AlertTriangle,
+  ArrowRight,
+  Layers,
+  Plus,
+  Trash2,
+  ChevronUp,
+  ChevronDown,
+} from "lucide-react";
+import {
+  getExamRubrics,
+  getJob,
+  getSampleBooklets,
+  gradeBooklet,
+  gradeManualAnswers,
+  gradeSampleBooklet,
+} from "../services/api";
 
 export default function BatchGrading({ examId, onFinished, onGoToReview }) {
   const [usn, setUsn] = useState("2SD23CS082");
@@ -12,6 +30,10 @@ export default function BatchGrading({ examId, onFinished, onGoToReview }) {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState("");
   const [result, setResult] = useState(null);
+  const [rubrics, setRubrics] = useState([]);
+  const [manualAnswers, setManualAnswers] = useState([]);
+  const [manualOpen, setManualOpen] = useState(false);
+  const [manualBusy, setManualBusy] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -74,11 +96,96 @@ export default function BatchGrading({ examId, onFinished, onGoToReview }) {
 
       const job = await poll(jobId);
       setResult(job);
+      if (job.transcript) {
+        const { data: rubricData } = await getExamRubrics(examId);
+        setRubrics(rubricData || []);
+        const detected = (job.segments || []).map((segment, index) => ({
+          id: `${Date.now()}-${index}`,
+          question_id: segment.mapped ? segment.question_id : "",
+          answer: segment.answer || "",
+        }));
+        setManualAnswers(
+          detected.length
+            ? detected
+            : [{ id: `${Date.now()}-0`, question_id: "", answer: job.transcript || "" }],
+        );
+        setManualOpen(Boolean(job.needs_review));
+      }
       onFinished?.();
     } catch (e) {
       setError(e.response?.data?.detail || e.message);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const updateManualAnswer = (id, patch) => {
+    setManualAnswers((current) =>
+      current.map((item) => (item.id === id ? { ...item, ...patch } : item)),
+    );
+  };
+
+  const moveManualAnswer = (index, direction) => {
+    const target = index + direction;
+    if (target < 0 || target >= manualAnswers.length) return;
+    setManualAnswers((current) => {
+      const updated = [...current];
+      [updated[index], updated[target]] = [updated[target], updated[index]];
+      return updated;
+    });
+  };
+
+  const submitManualAnswers = async () => {
+    setError("");
+    const answers = manualAnswers.map(({ question_id, answer }) => ({
+      question_id: question_id.trim().toUpperCase(),
+      answer: answer.trim(),
+    }));
+    if (!answers.length || answers.some((item) => !item.question_id || !item.answer)) {
+      setError("Assign a question and enter non-empty text for every answer, or remove unused answer fields.");
+      return;
+    }
+    if (new Set(answers.map((item) => item.question_id)).size !== answers.length) {
+      setError("Each question can be assigned once. Combine text for the same question into one answer field.");
+      return;
+    }
+
+    setManualBusy(true);
+    try {
+      const { data } = await gradeManualAnswers(examId, {
+        exam_id: examId,
+        student_id: result.student_id,
+        answers,
+      });
+      if (data.answers_evaluated_successfully !== data.answers_submitted) {
+        throw new Error(
+          `Only ${data.answers_evaluated_successfully} of ${data.answers_submitted} submitted answers were evaluated. Results were not finalized.`,
+        );
+      }
+      setResult((current) => ({
+        ...current,
+        needs_review: false,
+        results: data.submissions,
+        chunks: data.submissions.map((item) => item.question_id),
+        total_score: data.total_score,
+        max_possible_score: data.max_possible_score,
+        ia: data.ia,
+        message: `Manual review complete. All ${data.answers_evaluated_successfully} submitted answers were evaluated.`,
+        diagnostics: {
+          ...current.diagnostics,
+          answers_mapped_to_rubrics: data.answers_passed_to_grader,
+          answers_passed_to_grader: data.answers_passed_to_grader,
+          answers_evaluated_successfully: data.answers_evaluated_successfully,
+          answers_submitted_manually: data.answers_submitted,
+          skipped: [],
+        },
+      }));
+      setManualOpen(false);
+      onFinished?.();
+    } catch (e) {
+      setError(e.response?.data?.detail || e.message);
+    } finally {
+      setManualBusy(false);
     }
   };
 
@@ -251,12 +358,46 @@ export default function BatchGrading({ examId, onFinished, onGoToReview }) {
                 </p>
               </div>
               <span className="text-xs font-semibold bg-white/70 text-slate-800 px-3 py-1 rounded-full">
-                {result.chunks?.length || 0} Questions Segmented
+                {result.diagnostics?.answers_detected_by_segmentation ?? result.chunks?.length ?? 0} Answer Sections
               </span>
             </div>
 
             <p className="text-sm text-slate-800">{result.progress}</p>
             {result.message && <p className="text-sm text-slate-700">{result.message}</p>}
+
+            {result.diagnostics && (
+              <div className="grid grid-cols-2 md:grid-cols-6 gap-2 rounded-lg border border-slate-200 bg-white p-3 text-center text-xs">
+                <div><span className="block text-slate-500">OCR text lines</span><b>{result.diagnostics.ocr_nonempty_lines ?? 0}</b></div>
+                <div><span className="block text-slate-500">Answer sections detected</span><b>{result.diagnostics.answers_detected_by_segmentation ?? 0}</b></div>
+                <div><span className="block text-slate-500">Mapped to rubrics</span><b>{result.diagnostics.answers_mapped_to_rubrics ?? 0}</b></div>
+                <div><span className="block text-slate-500">Passed to grader</span><b>{result.diagnostics.answers_passed_to_grader ?? 0}</b></div>
+                <div><span className="block text-slate-500">Evaluated successfully</span><b>{result.diagnostics.answers_evaluated_successfully ?? 0}</b></div>
+                <div><span className="block text-slate-500">Submitted manually</span><b>{result.diagnostics.answers_submitted_manually ?? "—"}</b></div>
+              </div>
+            )}
+            {!!result.diagnostics?.detected_question_ids?.length && (
+              <p className="text-xs text-slate-600">
+                Detected question numbers: {result.diagnostics.detected_question_ids.join(", ")}.
+              </p>
+            )}
+
+            {!!result.diagnostics?.missing_question_ids?.length && (
+              <p className="text-xs text-slate-600">
+                No answer section was detected for: {result.diagnostics.missing_question_ids.join(", ")}.
+              </p>
+            )}
+            {!!result.diagnostics?.skipped?.length && (
+              <div className="rounded-lg border border-amber-200 bg-white p-3 text-xs text-amber-900">
+                <b>Sections requiring review</b>
+                <ul className="mt-1 list-disc pl-5">
+                  {result.diagnostics.skipped.map((item, index) => (
+                    <li key={`${item.question_id || "section"}-${index}`}>
+                      {item.question_id || "Answer section"}: {item.reason}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
 
             {result.transcript && (
               <details className="rounded-lg border border-slate-200 bg-white p-3" open>
@@ -271,6 +412,10 @@ export default function BatchGrading({ examId, onFinished, onGoToReview }) {
 
             {!!result.results?.length && (
               <div className="space-y-2">
+                <div className="rounded-lg border border-emerald-200 bg-white p-3 text-sm font-bold text-emerald-900">
+                  Total score: {result.total_score ?? result.results.reduce((sum, item) => sum + Number(item.ai_score || 0), 0)}
+                  {" / "}{result.max_possible_score ?? "—"}
+                </div>
                 {result.results.map((submission) => (
                   <article key={submission.question_id} className="rounded-lg border border-slate-200 bg-white p-3">
                     <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
@@ -287,6 +432,82 @@ export default function BatchGrading({ examId, onFinished, onGoToReview }) {
                   </article>
                 ))}
               </div>
+            )}
+
+            {result.transcript && (
+              <section className="space-y-3 rounded-xl border border-amber-300 bg-white p-4">
+                <div>
+                  <h4 className="font-bold text-slate-900">Manual answer separation</h4>
+                  <p className="mt-1 text-xs text-slate-600">
+                    {result.needs_review
+                      ? "Check every detected section, edit or split the OCR text, and assign each answer to its rubric question."
+                      : "If the transcript contains an answer that automatic segmentation missed, open this workflow to add or correct answer sections."}
+                    {" "}Submitting replaces the automatic results; each non-empty field is graded separately.
+                  </p>
+                </div>
+                {!result.needs_review && (
+                  <button
+                    type="button"
+                    onClick={() => setManualOpen((open) => !open)}
+                    className="rounded-lg border border-amber-300 px-3 py-2 text-xs font-semibold text-amber-900"
+                  >
+                    {manualOpen ? "Close manual answer editor" : "Edit / separate answers manually"}
+                  </button>
+                )}
+                {(result.needs_review || manualOpen) && <>
+                <div className="space-y-3">
+                  {manualAnswers.map((item, index) => (
+                    <article key={item.id} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                        <label className="text-xs font-semibold text-slate-700">
+                          Answer {index + 1}
+                          <select
+                            className="ml-2 min-w-36 rounded-md border border-slate-300 bg-white px-2 py-1.5"
+                            value={item.question_id}
+                            onChange={(event) => updateManualAnswer(item.id, { question_id: event.target.value })}
+                          >
+                            <option value="">Assign question…</option>
+                            {rubrics.map((rubric) => (
+                              <option key={rubric.question_id} value={rubric.question_id}>
+                                {rubric.question_id}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <div className="flex items-center gap-1">
+                          <button type="button" aria-label="Move answer up" disabled={index === 0} onClick={() => moveManualAnswer(index, -1)} className="rounded p-1 text-slate-500 disabled:opacity-30"><ChevronUp className="h-4 w-4" /></button>
+                          <button type="button" aria-label="Move answer down" disabled={index === manualAnswers.length - 1} onClick={() => moveManualAnswer(index, 1)} className="rounded p-1 text-slate-500 disabled:opacity-30"><ChevronDown className="h-4 w-4" /></button>
+                          <button type="button" aria-label="Delete answer" onClick={() => setManualAnswers((current) => current.filter((entry) => entry.id !== item.id))} className="rounded p-1 text-red-600"><Trash2 className="h-4 w-4" /></button>
+                        </div>
+                      </div>
+                      <textarea
+                        className="min-h-28 w-full rounded-md border border-slate-300 bg-white p-2 text-sm"
+                        value={item.answer}
+                        onChange={(event) => updateManualAnswer(item.id, { answer: event.target.value })}
+                        placeholder="Paste or edit the extracted answer text"
+                      />
+                    </article>
+                  ))}
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setManualAnswers((current) => [...current, { id: `${Date.now()}-${Math.random()}`, question_id: "", answer: "" }])}
+                    className="inline-flex items-center gap-1 rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700"
+                  >
+                    <Plus className="h-4 w-4" /> Add answer
+                  </button>
+                  <button
+                    type="button"
+                    disabled={manualBusy || !manualAnswers.length}
+                    onClick={submitManualAnswers}
+                    className="rounded-lg bg-amber-700 px-4 py-2 text-xs font-semibold text-white disabled:opacity-50"
+                  >
+                    {manualBusy ? "Evaluating every answer…" : "Confirm answers & evaluate"}
+                  </button>
+                </div>
+                </>}
+              </section>
             )}
 
             {result.ia && (

@@ -1,3 +1,4 @@
+import logging
 import threading
 import uuid
 from pathlib import Path
@@ -42,6 +43,7 @@ from database import (
 )
 from engine import LocalGradingEngine, generate_atomic_rubric
 
+logger = logging.getLogger(__name__)
 init_db()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -131,6 +133,17 @@ class EvaluateStudentRequest(BaseModel):
     exam_id: str
     student_id: str
     question_id: Optional[str] = None
+
+
+class ManualAnswerIn(BaseModel):
+    question_id: str
+    answer: str
+
+
+class ManualGradeIn(BaseModel):
+    exam_id: str
+    student_id: str
+    answers: List[ManualAnswerIn]
 
 
 class AssignSegmentRequest(BaseModel):
@@ -224,6 +237,17 @@ def _transcribe_and_grade(
             "transcript": transcript,
             "submissions": [],
             "chunks": [],
+            "segments": [],
+            "diagnostics": {
+                "ocr_nonempty_lines": 0,
+                "answers_detected_by_segmentation": 0,
+                "answers_mapped_to_rubrics": 0,
+                "answers_passed_to_grader": 0,
+                "answers_evaluated_successfully": 0,
+                "detected_question_ids": [],
+                "skipped": [{"reason": "OCR returned no readable text."}],
+                "missing_question_ids": [],
+            },
             "ia": calculate_ia_total({}),
             "needs_review": True,
             "message": "OCR found no readable text. Check the uploaded pages and handwriting.",
@@ -232,11 +256,58 @@ def _transcribe_and_grade(
     rubrics = get_exam_rubrics(exam_id)
     rubric_map = {rubric["question_id"].upper(): rubric for rubric in rubrics}
     chunks = chunk_student_booklet(transcript, rubrics)
-    grade_inputs = [
-        (question_id.upper(), answer.strip())
+    segments = [
+        {
+            "question_id": question_id.upper(),
+            "answer": answer.strip(),
+            "mapped": question_id.upper() in rubric_map,
+        }
         for question_id, answer in chunks.items()
-        if question_id.upper() in rubric_map and answer.strip()
     ]
+    grade_inputs = [
+        (segment["question_id"], segment["answer"])
+        for segment in segments
+        if segment["mapped"] and segment["answer"]
+    ]
+    skipped = [
+        {
+            "question_id": segment["question_id"],
+            "reason": "Detected section does not match a question in this exam's rubric.",
+        }
+        for segment in segments
+        if not segment["mapped"]
+    ]
+    skipped.extend(
+        {
+            "question_id": segment["question_id"],
+            "reason": "A question marker was detected, but its answer text is empty.",
+        }
+        for segment in segments
+        if segment["mapped"] and not segment["answer"]
+    )
+    missing_question_ids = sorted(set(rubric_map) - {qid for qid, _ in grade_inputs})
+    diagnostics = {
+        "ocr_nonempty_lines": sum(bool(line.strip()) for line in transcript.splitlines()),
+        "answers_detected_by_segmentation": len(segments),
+        "answers_mapped_to_rubrics": sum(segment["mapped"] for segment in segments),
+        "answers_passed_to_grader": 0,
+        "answers_evaluated_successfully": 0,
+        "detected_question_ids": [segment["question_id"] for segment in segments],
+        "skipped": skipped,
+        "missing_question_ids": missing_question_ids,
+    }
+    logger.info(
+        "Booklet %s/%s segmentation: OCR nonempty lines=%d, segments=%d, mapped=%d, "
+        "detected question IDs=%s, missing rubric IDs=%s, unmapped=%s",
+        exam_id,
+        student_id,
+        diagnostics["ocr_nonempty_lines"],
+        diagnostics["answers_detected_by_segmentation"],
+        diagnostics["answers_mapped_to_rubrics"],
+        [segment["question_id"] for segment in segments],
+        missing_question_ids,
+        [item["question_id"] for item in skipped],
+    )
 
     if not grade_inputs:
         delete_all_student_submissions(exam_id, student_id)
@@ -244,6 +315,8 @@ def _transcribe_and_grade(
             "transcript": transcript,
             "submissions": [],
             "chunks": [],
+            "segments": segments,
+            "diagnostics": diagnostics,
             "ia": calculate_ia_total({}),
             "needs_review": True,
             "message": "OCR is complete, but no question sections matched the exam rubrics. Review and assign the extracted text.",
@@ -254,14 +327,29 @@ def _transcribe_and_grade(
         for index, (question_id, answer) in enumerate(grade_inputs, start=1):
             rubric = rubric_map[question_id]
             report(f"BERT: grading {question_id} ({index}/{len(grade_inputs)})")
-            result = engine.evaluate_answer(
-                question_text=rubric["question_text"],
-                max_marks=rubric["max_marks"],
-                key_points=rubric["key_points"],
-                student_answer=answer,
-                reference_answer=rubric.get("reference_answer", ""),
-            )
-            evaluated.append((question_id, answer, result))
+            diagnostics["answers_passed_to_grader"] += 1
+            try:
+                result = engine.evaluate_answer(
+                    question_text=rubric["question_text"],
+                    max_marks=rubric["max_marks"],
+                    key_points=rubric["key_points"],
+                    student_answer=answer,
+                    reference_answer=rubric.get("reference_answer", ""),
+                )
+                result["ai_score"] = min(max(float(result["ai_score"]), 0.0), float(rubric["max_marks"]))
+                evaluated.append((question_id, answer, result))
+                diagnostics["answers_evaluated_successfully"] += 1
+            except Exception as exc:
+                logger.exception(
+                    "Grading failed for detected answer %s in booklet %s/%s",
+                    question_id,
+                    exam_id,
+                    student_id,
+                )
+                skipped.append({
+                    "question_id": question_id,
+                    "reason": f"Grading failed: {exc}",
+                })
 
         delete_all_student_submissions(exam_id, student_id)
         scores = {}
@@ -285,13 +373,35 @@ def _transcribe_and_grade(
     submissions = get_exam_submissions(exam_id, student_id)
     for submission in submissions:
         submission["max_marks"] = rubric_map[submission["question_id"].upper()]["max_marks"]
+    total_score = round(sum(float(item[2]["ai_score"]) for item in evaluated), 2)
+    max_possible_score = round(sum(float(rubric["max_marks"]) for rubric in rubrics), 2)
+    needs_review = bool(skipped)
+    if needs_review:
+        message = (
+            f"Automatic grading evaluated {len(evaluated)} of {len(segments)} detected answer sections. "
+            "Review skipped sections and use manual answer separation to map them before finalizing."
+        )
+    else:
+        message = f"TrOCR extraction and BERT grading complete. Evaluated {len(evaluated)} detected answer sections."
+    logger.info(
+        "Booklet %s/%s grading summary: passed=%d, evaluated=%d, skipped=%d",
+        exam_id,
+        student_id,
+        diagnostics["answers_passed_to_grader"],
+        diagnostics["answers_evaluated_successfully"],
+        len(skipped),
+    )
     return {
         "transcript": transcript,
         "submissions": submissions,
         "chunks": [question_id for question_id, _, _ in evaluated],
+        "segments": segments,
+        "diagnostics": diagnostics,
         "ia": calculate_ia_total(scores),
-        "needs_review": False,
-        "message": "TrOCR extraction and BERT grading complete.",
+        "total_score": total_score,
+        "max_possible_score": max_possible_score,
+        "needs_review": needs_review,
+        "message": message,
     }
 
 
@@ -456,7 +566,11 @@ async def upload_booklet(
         "text": result["transcript"],
         "submissions": result["submissions"],
         "chunks": result["chunks"],
+        "segments": result["segments"],
+        "diagnostics": result["diagnostics"],
         "ia": result["ia"],
+        "total_score": result.get("total_score", 0.0),
+        "max_possible_score": result.get("max_possible_score", 0.0),
         "message": result["message"],
         "image_urls": [public_file_url(p) for p in _relative_page_paths(page_paths)],
     }
@@ -577,6 +691,106 @@ def evaluate_student_endpoint(payload: EvaluateStudentRequest):
     }
 
 
+@app.post("/api/exams/{exam_id}/grade-manual")
+def grade_manual_answers(exam_id: str, payload: ManualGradeIn):
+    eid = exam_id.strip().upper()
+    sid = payload.student_id.strip().upper()
+    if payload.exam_id.strip().upper() != eid:
+        raise HTTPException(400, "Exam ID in URL and payload must match.")
+    if not sid:
+        raise HTTPException(400, "Student USN is required.")
+    if not payload.answers:
+        raise HTTPException(400, "Add at least one answer before grading.")
+
+    rubrics = get_exam_rubrics(eid)
+    if not rubrics:
+        raise HTTPException(404, f"No rubrics are configured for exam '{eid}'.")
+    rubric_map = {rubric["question_id"].upper(): rubric for rubric in rubrics}
+    seen_question_ids = set()
+    normalized_answers = []
+    for index, item in enumerate(payload.answers, start=1):
+        question_id = item.question_id.strip().upper()
+        answer = item.answer.strip()
+        if not question_id or question_id not in rubric_map:
+            raise HTTPException(400, f"Answer {index} must be assigned to a question with a configured rubric.")
+        if question_id in seen_question_ids:
+            raise HTTPException(400, f"Question {question_id} is assigned more than once. Combine its answer into one field.")
+        if not answer:
+            raise HTTPException(400, f"Answer {index} ({question_id}) is empty. Remove it or enter the answer text.")
+        seen_question_ids.add(question_id)
+        normalized_answers.append((question_id, answer, rubric_map[question_id]))
+
+    booklet = get_raw_booklet(eid, sid)
+    if not booklet:
+        raise HTTPException(404, "No OCR booklet is saved for this student. Upload a booklet first.")
+
+    evaluated = []
+    with grade_lock:
+        try:
+            for question_id, answer, rubric in normalized_answers:
+                try:
+                    result = engine.evaluate_answer(
+                        question_text=rubric["question_text"],
+                        max_marks=rubric["max_marks"],
+                        key_points=rubric["key_points"],
+                        student_answer=answer,
+                        reference_answer=rubric.get("reference_answer", ""),
+                    )
+                except Exception as exc:
+                    logger.exception("Manual grading failed for %s in booklet %s/%s", question_id, eid, sid)
+                    raise HTTPException(
+                        500,
+                        f"Manual grading failed for {question_id}; no manual results were saved. {exc}",
+                    ) from exc
+                result["ai_score"] = min(max(float(result["ai_score"]), 0.0), float(rubric["max_marks"]))
+                evaluated.append((question_id, answer, result, rubric))
+        finally:
+            engine.unload_model()
+
+    if len(evaluated) != len(payload.answers):
+        raise HTTPException(500, f"Only {len(evaluated)} of {len(payload.answers)} submitted answers were evaluated.")
+
+    delete_all_student_submissions(eid, sid)
+    scores = {}
+    for question_id, answer, result, _rubric in evaluated:
+        save_student_answer(eid, sid, question_id, booklet["image_paths"], answer)
+        update_evaluation(
+            exam_id=eid,
+            student_id=sid,
+            question_id=question_id,
+            matched_points=result["matched_points"],
+            missing_points=result["missing_points"],
+            ai_score=result["ai_score"],
+            ai_feedback=result["ai_feedback"],
+            similarity_score=result["similarity_score"],
+            keyword_coverage=result["keyword_coverage"],
+        )
+        scores[question_id] = result["ai_score"]
+
+    submissions = get_exam_submissions(eid, sid)
+    for submission in submissions:
+        submission["max_marks"] = rubric_map[submission["question_id"].upper()]["max_marks"]
+        submission["image_urls"] = [public_file_url(path) for path in submission.get("image_paths", [])]
+    logger.info(
+        "Manual booklet grading %s/%s: submitted=%d, passed=%d, evaluated=%d",
+        eid,
+        sid,
+        len(payload.answers),
+        len(normalized_answers),
+        len(evaluated),
+    )
+    return {
+        "status": "evaluated",
+        "submissions": submissions,
+        "answers_submitted": len(payload.answers),
+        "answers_passed_to_grader": len(normalized_answers),
+        "answers_evaluated_successfully": len(evaluated),
+        "total_score": round(sum(float(item[2]["ai_score"]) for item in evaluated), 2),
+        "max_possible_score": round(sum(float(rubric["max_marks"]) for rubric in rubrics), 2),
+        "ia": calculate_ia_total(scores),
+    }
+
+
 @app.post("/api/submissions/assign-segment")
 def assign_segment(payload: AssignSegmentRequest):
     try:
@@ -674,8 +888,12 @@ def _run_grade_job(job_id: str, exam_id: str, student_id: str, page_paths: List[
             result = _transcribe_and_grade(exam_id, student_id, page_paths, progress)
             job["transcript"] = result["transcript"]
             job["chunks"] = result["chunks"]
+            job["segments"] = result["segments"]
+            job["diagnostics"] = result["diagnostics"]
             job["results"] = result["submissions"]
             job["ia"] = result["ia"]
+            job["total_score"] = result.get("total_score", 0.0)
+            job["max_possible_score"] = result.get("max_possible_score", 0.0)
             job["needs_review"] = result["needs_review"]
             job["status"] = "done"
             job["progress"] = result["message"]
@@ -713,6 +931,8 @@ async def grade_booklet(
         "pages": len(page_paths),
         "transcript": "",
         "chunks": [],
+        "segments": [],
+        "diagnostics": {},
         "results": [],
     }
     background_tasks.add_task(_run_grade_job, job_id, exam_id.upper(), usn, page_paths)
@@ -749,6 +969,8 @@ def grade_sample_booklet(
         "pages": len(page_paths),
         "transcript": "",
         "chunks": [],
+        "segments": [],
+        "diagnostics": {},
         "results": [],
     }
     background_tasks.add_task(_run_grade_job, job_id, exam_id.upper(), usn, page_paths)
