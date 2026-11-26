@@ -11,6 +11,7 @@ from engine import (
     sanitize_ocr_text,
     _strip_coordinates_and_noise,
     _preprocess_page_image,
+    _crop_to_ink_region,
     LocalGradingEngine,
     extract_left_margin_marker,
 )
@@ -663,6 +664,50 @@ def test_strip_chat_prefixes_and_runaway_numbers():
     print("  [ok] _strip_coordinates_and_noise removes chat prefixes, markdown fences, and runaway numbers while preserving 2] a), 36), and content")
 
 
+def test_strip_repetition_loops_and_crop_to_ink():
+    """Verify _strip_coordinates_and_noise truncates repeated multi-word phrase loops occurring 3+ times
+    and _crop_to_ink_region crops empty bottom half below dark handwriting ink."""
+    from PIL import Image
+
+    # 1. Test regex loop truncator on user-supplied test string
+    loop_text = (
+        "d) scattered data e) transformation "
+        "f) and then use some sort of transformation "
+        "g) and then use some sort of transformation "
+        "h) and then use some sort of transformation"
+    )
+    cleaned = _strip_coordinates_and_noise(loop_text)
+    expected = "d) scattered data e) transformation f) and then use some sort of transformation"
+    assert cleaned == expected, f"Expected '{expected}', got '{cleaned}'"
+
+    # Also verify normal academic repetition does not falsely truncate
+    normal_text = (
+        "Research methodology involves qualitative research and quantitative research. "
+        "Qualitative research focuses on exploratory data."
+    )
+    assert _strip_coordinates_and_noise(normal_text) == normal_text
+
+    # 2. Test _crop_to_ink_region
+    # White image: no dark ink -> height preserved
+    white_img = Image.new("RGB", (800, 1000), color="white")
+    cropped_white = _crop_to_ink_region(white_img)
+    assert cropped_white.size == (800, 1000)
+
+    # Half-ink image: ink up to y=300 (with faint bleed-through at y=700)
+    ink_img = Image.new("RGB", (800, 1000), color="white")
+    pixels = ink_img.load()
+    # 25 dark ink pixels at y=300, x in 200..225
+    for x in range(200, 225):
+        pixels[x, 300] = (50, 50, 50)
+    # 5 faint bleed-through pixels at y=700 (below threshold count of > 15)
+    for x in range(200, 205):
+        pixels[x, 700] = (140, 140, 140)
+
+    cropped_ink = _crop_to_ink_region(ink_img)
+    assert cropped_ink.size == (800, 350), f"Expected height 350, got {cropped_ink.size[1]}"
+    print("  [ok] _strip_coordinates_and_noise truncates 3+ phrase repetition loops and _crop_to_ink_region trims empty bottom half")
+
+
 def test_preprocess_page_image_crops_top_margin():
     """Verify _preprocess_page_image crops out the top ~12% height (crop_box[1] >= int(h * 0.10))."""
     from PIL import Image
@@ -1159,6 +1204,7 @@ if __name__ == "__main__":
     test_generation_kwargs_clean_sampling()
     test_sanitize_hallucinations_and_coordinate_stripping()
     test_strip_chat_prefixes_and_runaway_numbers()
+    test_strip_repetition_loops_and_crop_to_ink()
     test_preprocess_page_image_crops_top_margin()
     test_choice_rule()
     test_teacher_parse_and_rubric()

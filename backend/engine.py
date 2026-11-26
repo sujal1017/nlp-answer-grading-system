@@ -4,6 +4,9 @@ import re
 import threading
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
+from PIL import Image
+
 # Enforce offline huggingface operation
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -268,6 +271,9 @@ def _strip_coordinates_and_noise(text: str) -> str:
     # Runaway sequential number runs of 8 or more space/newline-separated numbers (keeping short numbers/years/question markers intact)
     text = re.sub(r"(?:\b\d+\b(?![)\]:.-])[\s,]*){8,}", "", text)
 
+    # Truncate repeated multi-word phrase loops occurring 3+ times
+    text = re.sub(r'(\b(?:\w+\s+){3,8}\w+\b)(?:.*?\1){2,}.*', r'\1', text, flags=re.IGNORECASE | re.DOTALL)
+
     return text.strip()
 
 
@@ -296,13 +302,44 @@ def sanitize_ocr_text(text: str) -> str:
     return text
 
 
+def _crop_to_ink_region(img_or_path: Union[str, Image.Image]) -> Image.Image:
+    """Finds lowest row containing significant dark handwriting ink and trims empty bottom half."""
+    if isinstance(img_or_path, str):
+        img = Image.open(img_or_path).convert("RGB")
+    else:
+        img = img_or_path
+
+    w, h = img.size
+    gray = img.convert("L")
+    arr = np.array(gray)
+
+    # Mask out top 6% header margin and left 12% margin line
+    top_mask_y = int(h * 0.06)
+    left_mask_x = int(w * 0.12)
+    arr[:top_mask_y, :] = 255
+    arr[:, :left_mask_x] = 255
+
+    # Threshold for dark handwriting ink (< 155), ignoring faint bleed-through and light ruled lines
+    dark_pixels = (arr < 155)
+    row_counts = np.sum(dark_pixels, axis=1)
+
+    # Find lowest row with > 15 dark pixels
+    significant_rows = np.where(row_counts > 15)[0]
+    if len(significant_rows) > 0:
+        max_y = int(significant_rows[-1])
+        crop_bottom = min(h, max_y + 50)
+        if crop_bottom < h:
+            return img.crop((0, 0, w, crop_bottom))
+    return img
+
+
 def _preprocess_page_image(image_path: str, top_margin_ratio: float = 0.12) -> str:
     """Enhance contrast and sharpness for faint handwritten blue ink and lined backgrounds,
-    cropping out the top header margin (default 12%)."""
+    cropping out the top header margin (default 12%) and trimming bottom whitespace without ink."""
     if not os.path.exists(image_path):
         return image_path
     try:
-        from PIL import Image, ImageEnhance, ImageOps
+        from PIL import ImageEnhance, ImageOps
         import tempfile
         with Image.open(image_path) as img:
             rgb_img = img.convert("RGB")
@@ -310,6 +347,7 @@ def _preprocess_page_image(image_path: str, top_margin_ratio: float = 0.12) -> s
             top_crop_y = int(h * top_margin_ratio) if top_margin_ratio > 0 else 0
             crop_box = (0, top_crop_y, w, h)
             cropped = rgb_img.crop(crop_box)
+            cropped = _crop_to_ink_region(cropped)
             contrasted = ImageOps.autocontrast(cropped, cutoff=1)
             contrasted = ImageEnhance.Contrast(contrasted).enhance(1.35)
             sharpened = ImageEnhance.Sharpness(contrasted).enhance(1.5)
@@ -481,8 +519,9 @@ class LocalGradingEngine:
         messages: List[Dict],
         max_tokens: int = 768,
         temperature: float = 0.0,
-        repetition_penalty: float = 1.05,
+        repetition_penalty: float = 1.18,
         top_p: Optional[float] = None,
+        no_repeat_ngram_size: int = 4,
     ) -> str:
         with self._lock:
             self.load_model()
@@ -512,6 +551,7 @@ class LocalGradingEngine:
             gen_kwargs = {
                 "max_new_tokens": max_tokens,
                 "repetition_penalty": repetition_penalty,
+                "no_repeat_ngram_size": no_repeat_ngram_size,
             }
             if bad_words_ids:
                 gen_kwargs["bad_words_ids"] = bad_words_ids
@@ -574,6 +614,13 @@ class LocalGradingEngine:
                 if enhanced_path != img_path:
                     cleanup_files.append(enhanced_path)
 
+                # Dynamically scale max_tokens based on the cropped height
+                with Image.open(img_path) as orig_im:
+                    orig_h = orig_im.height
+                with Image.open(enhanced_path) as enh_im:
+                    cropped_h = enh_im.height
+                dynamic_max_tokens = max(160, int(1024 * (cropped_h / max(orig_h, 1))))
+
                 page_text = ""
                 words_count = 0
                 try:
@@ -588,7 +635,11 @@ class LocalGradingEngine:
                         }
                     ]
                     page_text = self._generate_text(
-                        messages, max_tokens=1024, temperature=0.0, repetition_penalty=1.05
+                        messages,
+                        max_tokens=dynamic_max_tokens,
+                        temperature=0.0,
+                        repetition_penalty=1.18,
+                        no_repeat_ngram_size=4,
                     )
                     words_count = len(re.findall(r'[a-zA-Z]{3,}', page_text))
 
@@ -601,11 +652,17 @@ class LocalGradingEngine:
                             cleanup_files.extend([p_top, p_bot])
                             top_text = self._generate_text(
                                 [{"role": "user", "content": [{"type": "image", "image": p_top}, {"type": "text", "text": prompt_split}]}],
-                                max_tokens=768, temperature=0.0, repetition_penalty=1.05
+                                max_tokens=max(160, int(dynamic_max_tokens * 0.75)),
+                                temperature=0.0,
+                                repetition_penalty=1.18,
+                                no_repeat_ngram_size=4,
                             )
                             bot_text = self._generate_text(
                                 [{"role": "user", "content": [{"type": "image", "image": p_bot}, {"type": "text", "text": prompt_split}]}],
-                                max_tokens=768, temperature=0.0, repetition_penalty=1.05
+                                max_tokens=max(160, int(dynamic_max_tokens * 0.75)),
+                                temperature=0.0,
+                                repetition_penalty=1.18,
+                                no_repeat_ngram_size=4,
                             )
                             candidate_text = f"{top_text}\n{bot_text}".strip()
                             candidate_words = len(re.findall(r'[a-zA-Z]{3,}', candidate_text))
@@ -620,7 +677,11 @@ class LocalGradingEngine:
                         print(f"[*] Page {idx + 1} produced only {words_count} words (<15 words). Running Attempt 3 (Mild Sampling Fallback)...")
                         try:
                             sample_text = self._generate_text(
-                                messages, max_tokens=1024, temperature=0.2, repetition_penalty=1.08
+                                messages,
+                                max_tokens=dynamic_max_tokens,
+                                temperature=0.2,
+                                repetition_penalty=1.18,
+                                no_repeat_ngram_size=4,
                             )
                             sample_words = len(re.findall(r'[a-zA-Z]{3,}', sample_text))
                             if sample_words > words_count:
